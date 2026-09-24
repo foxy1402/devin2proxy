@@ -1,0 +1,62 @@
+# devin2proxy — Portainer stack for a public VM (tested shape: Google e2-micro).
+#
+# Usage: in Portainer, Stacks → add stack → paste this whole file, then set
+# the four secrets below (Portainer's environment editor, an env file next to
+# the stack, or `docker compose --env-file`). Do not commit real values into
+# this file — the ${...} placeholders are resolved from the environment.
+#
+# The image is published from main by .github/workflows/docker.yml:
+#
+#   ghcr.io/foxy1402/devin2proxy:latest
+#
+# Secrets the deployment needs:
+#
+#   DEVIN2PROXY_API_KEY   the one fixed key gating /v1 (sk-devin-…)
+#   DEVIN_TOKEN           the Devin session credential (devin-session-token$…)
+#   DEVIN2PROXY_DASHBOARD_PASSWORD
+#                         the dashboard login password
+#   DEVIN2PROXY_TLS_NAMES the machine's public IP, so the generated certificate
+#                         carries it (127.0.0.1 and localhost are always in)
+#
+# Everything else has a default here.
+
+services:
+  devin2proxy:
+    image: ghcr.io/foxy1402/devin2proxy:latest
+    container_name: devin2proxy
+    restart: unless-stopped
+    ports:
+      # Published on every interface: the GCP firewall decides who can actually
+      # reach it. The API key and the TLS certificate are the real gates.
+      - "8788:8788"
+    environment:
+      DEVIN2PROXY_ADDR: 0.0.0.0:8788
+      DEVIN2PROXY_API_KEY: ${DEVIN2PROXY_API_KEY}
+      DEVIN_TOKEN: ${DEVIN_TOKEN}
+      # TLS on, self-signed certificate generated into /data on first start and
+      # reused from then on. Its SHA-256 fingerprint is printed at startup —
+      # check it once, then hand clients /data/tls.crt to trust.
+      DEVIN2PROXY_TLS: "1"
+      DEVIN2PROXY_TLS_NAMES: ${DEVIN2PROXY_TLS_NAMES:-}
+      # The dashboard is the second surface: password-gated, and every button
+      # and data endpoint behind that gate. Remote access is what makes it
+      # reachable at all from your laptop; with TLS on, the session cookie is
+      # marked Secure and the password never crosses the wire in cleartext.
+      DEVIN2PROXY_DASHBOARD: "1"
+      DEVIN2PROXY_DASHBOARD_PASSWORD: ${DEVIN2PROXY_DASHBOARD_PASSWORD}
+      DEVIN2PROXY_DASHBOARD_ALLOW_REMOTE: "true"
+      # Optional: a pool of accounts to rotate instead of the single DEVIN_TOKEN.
+      # DEVIN2PROXY_TOKENS: ${DEVIN2PROXY_TOKENS:-}
+    volumes:
+      # /data holds config.json (only if the API key were NOT given by env),
+      # dashboard.json (password hash, session secret, managed accounts and
+      # routes), and tls.crt / tls.key. The volume is what makes the
+      # certificate stable across restarts — TOFU depends on that.
+      - devin2proxy-data:/data
+    # The env-supplied key means the process writes nothing outside /data, so
+    # the root filesystem can be read-only. Drop this line if you remove
+    # DEVIN2PROXY_API_KEY from the environment.
+    read_only: true
+
+volumes:
+  devin2proxy-data:

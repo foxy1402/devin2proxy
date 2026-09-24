@@ -1,0 +1,42 @@
+# The build copies only go.mod, cmd/ and internal/, so nothing here could reach
+# an image layer by accident. This file is the second lock on the door: the
+# credential-bearing paths below must never be part of the build context at all,
+# because a context upload sends them to the daemon and a future COPY . . would
+# bake them in.
+captures/
+captures-relay/
+captures-*/
+config.json
+dashboard.json
+dashboard.json.tmp
+tokens*.txt
+*-tokens.txt
+accounts*.txt
+*.log
+*.log~
+*~
+
+# Not needed to build the binary, and tools/node_modules is large.
+tools/
+node_modules/
+package-lock.json
+
+# Version control and editor/agent state.
+.git
+.gitignore
+.zcode/
+.probe-ws/
+
+# Already-compiled host binaries; the image builds its own.
+bin/
+*.exe
+*.exe~
+*.test
+*.out
+
+# Documentation is read from the repo, not served by the image.
+docs/
+README.md
+config.example.json
+Dockerfile
+.dockerignore

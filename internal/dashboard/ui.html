@@ -1,0 +1,1477 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>devin2proxy</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel2: #1e2230;
+    --line: #2a2f3d;
+    --fg: #e6e8ee;
+    --dim: #939aab;
+    --accent: #6ea8fe;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --err: #f87171;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  a { color: var(--accent); }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+  h2 { font-size: 13px; margin: 0 0 .6rem; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+  code, .mono { font-family: var(--mono); font-size: 12.5px; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 1.1rem 1.2rem 3rem; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.1rem; margin-bottom: 1rem; }
+  .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  .spread { justify-content: space-between; }
+  .grow { flex: 1 1 auto; min-width: 0; }
+  .muted { color: var(--dim); }
+  .small { font-size: 12.5px; }
+  .trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  button {
+    font: inherit; font-size: 13px; color: var(--fg); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 7px; padding: .38rem .7rem; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: #3d4459; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: #1d3a6e; border-color: #2b5397; }
+  button.danger { color: var(--err); }
+  input, textarea, select {
+    font: inherit; font-size: 13px; color: var(--fg); background: #12141a;
+    border: 1px solid var(--line); border-radius: 7px; padding: .42rem .55rem; width: 100%;
+  }
+  textarea { font-family: var(--mono); font-size: 12.5px; min-height: 9rem; resize: vertical; }
+  label.check { display: inline-flex; gap: .4rem; align-items: center; width: auto; }
+  label.check input { width: auto; }
+  fieldset { border: 0; margin: 0; padding: 0; }
+  .field { margin-bottom: .7rem; }
+  .field > span { display: block; font-size: 12px; color: var(--dim); margin-bottom: .25rem; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: .45rem .5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+
+  .chip { display: inline-block; font-size: 11.5px; padding: .05rem .42rem; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); white-space: nowrap; }
+  .chip.ok { color: var(--ok); border-color: #245c3a; }
+  .chip.warn { color: var(--warn); border-color: #5c4a1a; }
+  .chip.err { color: var(--err); border-color: #5c2727; }
+  .chip.k { color: var(--accent); border-color: #26406b; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: .6rem; }
+  .stat { background: var(--panel2); border: 1px solid var(--line); border-radius: 9px; padding: .55rem .7rem; }
+  .stat b { display: block; font-size: 19px; font-weight: 650; }
+  .stat span { font-size: 12px; color: var(--dim); }
+
+  .tabs { display: flex; gap: .35rem; border-bottom: 1px solid var(--line); margin-bottom: .9rem; }
+  .tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--dim); padding: .5rem .7rem; }
+  .tabs button.on { color: var(--fg); border-bottom-color: var(--accent); }
+
+  .logs { font-family: var(--mono); font-size: 12.5px; max-height: 62vh; overflow: auto; background: #0c0e13; border: 1px solid var(--line); border-radius: 9px; }
+  .log { display: grid; grid-template-columns: 68px 54px 66px 1fr; gap: .5rem; padding: .3rem .6rem; border-bottom: 1px solid #1a1d25; }
+  .log:last-child { border-bottom: 0; }
+  .log .t { color: #6b7280; }
+  .log .msg { white-space: pre-wrap; word-break: break-word; }
+  .log.warn .lvl { color: var(--warn); }
+  .log.error .lvl { color: var(--err); }
+  .log.info .lvl { color: var(--dim); }
+  .log .err { color: var(--err); }
+
+  .modal { position: fixed; inset: 0; background: rgba(6,8,12,.72); display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 20; }
+  .modal > div { background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 1rem 1.1rem; width: 100%; max-width: 620px; max-height: 88vh; overflow: auto; }
+  pre.term { font-family: var(--mono); font-size: 12px; background: #0c0e13; border: 1px solid var(--line); border-radius: 8px; padding: .6rem .7rem; max-height: 15rem; overflow: auto; white-space: pre-wrap; margin: .6rem 0 0; }
+  .banner { border-radius: 9px; padding: .6rem .75rem; margin-bottom: .8rem; font-size: 13px; border: 1px solid; }
+  .banner.err { color: #ffd9d9; background: #2a1616; border-color: #5c2727; }
+  .banner.warn { color: #ffeec2; background: #2a2312; border-color: #5c4a1a; }
+  .banner.ok { color: #d7ffe6; background: #10261a; border-color: #245c3a; }
+  .banner.info { color: #d8e6ff; background: #141c2e; border-color: #2a3d63; }
+  .center { max-width: 380px; margin: 12vh auto; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: .1rem .7rem; font-size: 12.5px; }
+  .kv dt { color: var(--dim); }
+  .kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<div id="root" class="wrap"></div>
+<script>
+"use strict";
+(function () {
+  var API = "/dashboard/api";
+  var $ = document.getElementById.bind(document);
+
+  // ---------------------------------------------------------------- utilities
+
+  function el(tag, props) {
+    var node = document.createElement(tag);
+    if (props) {
+      for (var k in props) {
+        var v = props[k];
+        if (v === null || v === undefined || v === false) continue;
+        if (k === "class") node.className = v;
+        else if (k === "text") node.textContent = v;
+        else if (k === "html") node.innerHTML = v;
+        else if (k.slice(0, 2) === "on") node.addEventListener(k.slice(2), v);
+        else if (k === "value") node.value = v;
+        else if (v === true) node.setAttribute(k, "");
+        else node.setAttribute(k, v);
+      }
+    }
+    for (var i = 2; i < arguments.length; i++) append(node, arguments[i]);
+    return node;
+  }
+
+  function append(node, kid) {
+    if (kid === null || kid === undefined || kid === false) return;
+    if (Array.isArray(kid)) { kid.forEach(function (k) { append(node, k); }); return; }
+    node.appendChild(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function fmtTime(iso) {
+    var d = new Date(iso);
+    if (isNaN(d)) return "";
+    return d.toLocaleTimeString(undefined, { hour12: false }) + "." +
+      String(d.getMilliseconds()).padStart(3, "0");
+  }
+
+  // until renders a deadline as a wait, and stays a wait rather than a timestamp:
+  // "in 4m" is what decides whether to look at this now.
+  function until(iso) {
+    if (!iso) return "";
+    var ms = new Date(iso).getTime() - Date.now();
+    if (isNaN(ms)) return "";
+    if (ms <= 0) return "now";
+    var s = Math.round(ms / 1000);
+    if (s < 90) return s + "s";
+    var m = Math.round(s / 60);
+    if (m < 90) return m + "m";
+    var hr = Math.round(m / 60);
+    if (hr < 48) return hr + "h";
+    return Math.round(hr / 24) + "d";
+  }
+
+  // ago is until's mirror image: how long ago something was read, which is what
+  // decides whether to ask for it again.
+  function ago(iso) {
+    if (!iso) return "";
+    var ms = Date.now() - new Date(iso).getTime();
+    if (isNaN(ms) || ms < 0) return "";
+    var s = Math.round(ms / 1000);
+    if (s < 90) return s + "s ago";
+    var m = Math.round(s / 60);
+    if (m < 90) return m + "m ago";
+    var hr = Math.round(m / 60);
+    return hr + "h ago";
+  }
+
+  // fmtTokens renders a token count as the exact figure with thousands grouped:
+  // these numbers are the point of the model table, and "1,047,576" says more than
+  // a rounded "1M" when the models differ by a few percent.
+  function fmtTokens(n) {
+    if (!n) return "";
+    return Number(n).toLocaleString("en-US");
+  }
+
+  async function api(path, opts) {
+    opts = opts || {};
+    var init = { method: opts.method || "GET", credentials: "same-origin", headers: {} };
+    if (opts.body !== undefined) {
+      init.headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(opts.body);
+    }
+    var res = await fetch(API + path, init);
+    var ct = res.headers.get("content-type") || "";
+    var data = null;
+    if (ct.indexOf("application/json") >= 0) { try { data = await res.json(); } catch (e) { data = null; } }
+    if (!res.ok) {
+      var msg = (data && data.error) || ("request failed with HTTP " + res.status);
+      var err = new Error(msg);
+      err.status = res.status;
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  function banner(kind, text) { return el("div", { class: "banner " + kind, text: text }); }
+
+  // ------------------------------------------------------------------- state
+
+  var S = {
+    session: null,
+    info: null,
+    accounts: [],
+    accountMeta: {},
+    // statusAutoChecked records that the Accounts tab has already asked the
+    // backend about the pool once this page load, so opening the tab shows each
+    // account's plan and quota without anyone having to find the button.
+    statusAutoChecked: false,
+    // probeModel is the model id a test uses (the picker's value), probeResults the
+    // last outcome per account index, and probeBusy which tests are in flight.
+    probeModel: null,
+    probeResults: {},
+    probeBusy: {},
+    probeModelsTried: false,
+    // catalogue is the last model catalogue read from the backend, for the Models
+    // tab. Null until that tab asks for one.
+    catalogue: null,
+    proxyPanel: null,
+    proxyText: null,
+    probes: {},
+    tab: "accounts",
+    logs: [],
+    logsPaused: false,
+    logsPolledOnce: false,
+    logFilter: { kind: "", level: "", q: "" },
+    logTimer: null,
+    dropped: 0,
+    overviewTimer: null
+  };
+
+  // ------------------------------------------------------------------- login
+
+  function renderLogin() {
+    var root = $("root");
+    clear(root);
+    var card = el("div", { class: "card center" }, el("h1", { text: "devin2proxy" }));
+
+    if (S.session && !S.session.configured) {
+      card.appendChild(banner("warn",
+        "No dashboard password is set, so there is nothing to sign in with. " +
+        "Restart the proxy with -dashboard-password, or set dashboard_password in config.json."));
+      root.appendChild(card);
+      return;
+    }
+
+    var st = (S.session && S.session.login) || { strikes: 0, remaining: 3 };
+    var banned = st.banned;
+
+    if (banned) {
+      card.appendChild(banner("err", "Too many failed attempts. Logins from this machine are banned for " +
+        until(st.until) + " (" + st.strikes + " failures in a row). Each further failure extends the ban."));
+    } else if (st.strikes > 0) {
+      card.appendChild(banner("warn", st.remaining + " attempt" + (st.remaining === 1 ? "" : "s") +
+        " left before logins are banned."));
+    }
+
+    var input = el("input", { type: "password", autocomplete: "current-password", placeholder: "dashboard password", autofocus: true });
+    var msg = el("div", { class: "small" });
+    var btn = el("button", { class: "primary", text: banned ? "Banned" : "Sign in", disabled: banned });
+
+    async function signIn() {
+      if (banned) return;
+      btn.disabled = true;
+      msg.textContent = "";
+      try {
+        await api("/login", { method: "POST", body: { password: input.value } });
+        input.value = "";
+        await boot();
+      } catch (err) {
+        msg.appendChild(banner(err.status === 429 ? "err" : "warn", err.message));
+        try { S.session = await api("/session"); } catch (e) { /* stays as it was */ }
+        // A ban or a decremented allowance has to show up on the page, so the form
+        // is redrawn from the fresh session rather than patched in place.
+        if (S.session && (S.session.login.banned || S.session.login.strikes !== st.strikes)) {
+          renderLogin();
+          return;
+        }
+        btn.disabled = false;
+        input.focus();
+      }
+    }
+
+    input.addEventListener("keydown", function (e) { if (e.key === "Enter") signIn(); });
+    btn.addEventListener("click", signIn);
+
+    var form = el("form", {
+      onsubmit: function (e) { e.preventDefault(); signIn(); }
+    },
+      el("div", { class: "field" }, el("span", { text: "password" }), input),
+      el("div", { class: "row" }, btn),
+      msg
+    );
+    card.appendChild(form);
+
+    if (S.session && S.session.remote) {
+      card.appendChild(el("div", { class: "small muted", style: "margin-top:.7rem" },
+        "Signed in from another machine: this dashboard can add and delete credentials, so the connection should be trusted."));
+    }
+    root.appendChild(card);
+  }
+
+  // ------------------------------------------------------------------ shell
+
+  function renderShell() {
+    var root = $("root");
+    clear(root);
+
+    var tabs = el("div", { class: "tabs" });
+    [["accounts", "Accounts pool"], ["models", "Models"], ["proxies", "Proxy pool"], ["logs", "Logs"]].forEach(function (pair) {
+      tabs.appendChild(el("button", {
+        class: S.tab === pair[0] ? "on" : "",
+        text: pair[1],
+        onclick: function () { S.tab = pair[0]; renderShell(); }
+      }));
+    });
+
+    root.appendChild(el("div", { class: "card" },
+      el("div", { class: "row spread" },
+        el("div", { class: "row" },
+          el("h1", { text: "devin2proxy" }),
+          el("span", { class: "chip k", id: "hdr-backend", text: headerBackend() })
+        ),
+        el("div", { class: "row" },
+          el("button", { text: "Sign out", onclick: signOut })
+        )
+      ),
+      el("div", { class: "stats", style: "margin-top:.8rem", id: "hdr-stats" })
+    ));
+
+    var body = el("div", { id: "tab-body" });
+    root.appendChild(tabs);
+    root.appendChild(body);
+
+    // Drawing is wrapped so a fault inside one panel shows up on the page instead
+    // of leaving the tab silently blank, which is how a null list field masked as
+    // "the proxy pool shows nothing at all" once already.
+    try {
+      if (S.tab === "accounts") renderAccounts(body);
+      else if (S.tab === "models") renderModels(body);
+      else if (S.tab === "proxies") renderProxies(body);
+      else renderLogs(body);
+    } catch (err) {
+      body.appendChild(banner("err", "could not draw this section: " + (err && err.message ? err.message : String(err))));
+    }
+    renderStats();
+  }
+
+  function headerBackend() {
+    if (!S.info) return "…";
+    return S.info.backend + " · " + S.info.model;
+  }
+
+  function renderStats() {
+    var node = $("hdr-stats");
+    if (!node) return;
+    clear(node);
+    var accounts = S.accountMeta.count || 0;
+    var routes = S.proxyPanel ? S.proxyPanel.count : 0;
+    var stats = [
+      ["accounts", accounts, S.accountMeta.using_cli_creds ? "using the CLI's own credential" : S.accountMeta.available + " available"],
+      ["routes", routes, S.proxyPanel ? S.proxyPanel.available + " available" : ""],
+      ["quota holds", S.accountMeta.quota_held || 0, S.info && S.info.quota_cooldown ? "quota cooldown on" : "quota cooldown off"],
+      ["log events", S.logs.length, "newest first · every 3s" + (S.dropped ? " · " + S.dropped + " dropped for a slow reader" : "")]
+    ];
+    stats.forEach(function (s) {
+      node.appendChild(el("div", { class: "stat" },
+        el("b", { text: String(s[1]) }),
+        el("span", { text: s[0] }),
+        s[2] ? el("span", { class: "small muted", text: s[2] }) : null
+      ));
+    });
+    var back = $("hdr-backend");
+    if (back) back.textContent = headerBackend();
+  }
+
+  async function signOut() {
+    try { await api("/logout", { method: "POST" }); } catch (e) { /* cookie is cleared either way */ }
+    stopStream();
+    S.logs = [];
+    S.logsPolledOnce = false;
+    await boot();
+  }
+
+  // --------------------------------------------------------------- accounts
+
+  function accountLabel(a) {
+    var st = a.status;
+    if (hasIdentity(a)) return st.email || st.name;
+    return "…" + a.tail;
+  }
+
+  // hasIdentity reports whether the backend has told us who this account is. Until
+  // it has, a row can only be identified by the token's tail.
+  function hasIdentity(a) {
+    return !!(a.status && (a.status.email || a.status.name));
+  }
+
+  function accountState(a) {
+    var chips = [];
+    if (a.quota_held) chips.push(el("span", { class: "chip warn", text: "quota hold " + until(a.quota_until) }));
+    if (!a.available) chips.push(el("span", { class: "chip err", text: "cooling " + until(a.cooling_until) }));
+    if (a.available && !a.quota_held) chips.push(el("span", { class: "chip ok", text: "ready" }));
+    if (a.status_pending) chips.push(el("span", { class: "chip", text: "checking" }));
+    if (a.last_served) chips.push(el("span", { class: "chip k", text: "last served" }));
+    return chips;
+  }
+
+  // spans is until's two-unit form: the CLI prints "41% remaining (reset in 3d 7h)"
+  // and a countdown that says only "3d" hides whether the window refills at dawn or
+  // at midnight.
+  function spans(iso) {
+    if (!iso) return "";
+    var ms = new Date(iso).getTime() - Date.now();
+    if (isNaN(ms)) return "";
+    if (ms <= 0) return "";
+    var mins = Math.round(ms / 60000);
+    var days = Math.floor(mins / 1440), hours = Math.floor((mins % 1440) / 60), rest = mins % 60;
+    if (days > 0) return days + "d " + hours + "h";
+    if (hours > 0) return hours + "h " + rest + "m";
+    if (mins > 0) return mins + "m";
+    return "under a minute";
+  }
+
+  // quotaWindow renders one quota window the way the CLI's main page does, so the
+  // number an operator sees here is the one they recognise: "week 41% remaining
+  // (resets in 3d 7h)". A window at 0% is the only alarming reading, and is the
+  // reason the percentage is sent as absent-or-number rather than as 0-by-default.
+  function quotaWindow(label, percent, reset) {
+    if (percent === undefined || percent === null) return null;
+    var line = el("div", { class: percent === 0 ? "err" : "" },
+      label + " " + percent + "% remaining" + (spans(reset) ? " (resets in " + spans(reset) + ")" : ""));
+    return line;
+  }
+
+  function quotaCell(a) {
+    var st = a.status;
+    if (!st) return el("span", { class: "muted small", text: "unknown" });
+    var parts = [];
+    if (st.plan) parts.push(st.plan);
+    if (st.models) parts.push(st.models + " models");
+    var windows = [
+      quotaWindow("week", st.weekly_quota_remaining_percent, st.weekly_reset),
+      quotaWindow("today", st.daily_quota_remaining_percent, st.daily_reset)
+    ].filter(Boolean);
+    // A reset with no percentage beside it is still worth saying: the backend only
+    // sends the percentage fields when they have something to say.
+    if (!windows.length) {
+      var resets = [];
+      if (st.daily_reset) resets.push("daily in " + until(st.daily_reset));
+      if (st.weekly_reset) resets.push("weekly in " + until(st.weekly_reset));
+      if (resets.length) windows.push(el("div", { class: "muted" }, resets.join(" · ")));
+    }
+    var counters = [];
+    if (st.plan_fields) {
+      Object.keys(st.plan_fields).sort(function (x, y) { return x - y; }).forEach(function (k) {
+        counters.push(el("span", {
+          class: "chip" + (st.plan_fields[k] === 0 ? " err" : ""),
+          text: k + "=" + st.plan_fields[k]
+        }));
+      });
+    }
+    return el("div", { class: "small" },
+      el("div", { text: parts.join(" · ") || "—" }),
+      windows.length ? el("div", { style: "margin-top:.15rem" }, windows) : null,
+      counters.length ? el("div", { class: "row", style: "margin-top:.25rem;gap:.25rem" }, counters) : null
+    );
+  }
+
+  // probeModelPicker is the model id a test uses. The list is the backend's own
+  // catalogue, read the way the CLI reads it, so the ids offered are the ids that
+  // would be accepted; the three groups are the proxy's own served ids first, then
+  // what this plan allows, then what it gates. The default is the model this proxy
+  // serves — the uid a client's request actually becomes — which is the id worth
+  // testing with.
+  //
+  // An id can be both served and gated (the proxy forwards it, the plan does not
+  // include it), so each uid belongs to exactly one group: a forwarded id stays in
+  // the served group and says there that the plan gates it, rather than appearing
+  // twice in the list.
+  function probeModelPicker() {
+    var cats = (S.catalogue && S.catalogue.probe_models) || [];
+    var groups = [
+      ["Served at /v1", cats.filter(function (m) { return m.served; })],
+      ["Available on this plan", cats.filter(function (m) { return !m.served && !m.gated; })],
+      ["Gated behind a higher plan", cats.filter(function (m) { return m.gated && !m.served; })]
+    ];
+    var chosen = probeModel();
+    var sel = el("select", {
+      class: "mono",
+      title: "The model id a test asks the backend for",
+      onchange: function (e) { S.probeModel = e.target.value; }
+    });
+    groups.forEach(function (g) {
+      if (!g[1].length) return;
+      var opts = g[1].map(function (m) {
+        return el("option", {
+          value: m.uid,
+          text: m.gated ? m.uid + " (gated on this plan)" : m.uid,
+          selected: m.uid === chosen
+        });
+      });
+      sel.appendChild(el("optgroup", { label: g[0] }, opts));
+    });
+    if (!cats.length) {
+      sel.appendChild(el("option", { value: chosen, text: chosen }));
+    }
+    return el("label", { class: "small muted", style: "margin-left:.4rem" },
+      "test with ", sel,
+      !cats.length ? el("span", { class: "small muted", text: " (reading the model catalogue…)" }) : null);
+  }
+
+  // probeModel is the id a test will use: whatever was picked, else the proxy's
+  // default, else the first id the catalogue offers.
+  function probeModel() {
+    if (S.probeModel) return S.probeModel;
+    var cats = (S.catalogue && S.catalogue.probe_models) || [];
+    var dflt = (S.catalogue && S.catalogue.probe_default) || (S.info && S.info.model) || "";
+    if (dflt && (!cats.length || cats.some(function (m) { return m.uid === dflt; }))) return dflt;
+    return cats.length ? cats[0].uid : (dflt || "swe-1-6-slow");
+  }
+
+  // probeNote renders the outcome of a test under the row's buttons, which is where
+  // the button that produced it is. Both outcomes are shown: a refusal names the
+  // backend's own reason, and "it failed" without that reason is not something an
+  // operator can act on.
+  function probeNote(index) {
+    var r = S.probeResults[index];
+    if (!r) return null;
+    if (r.busy) return el("div", { class: "small muted", text: "testing…" });
+    if (!r.ok) {
+      var why = r.probe ? (r.probe.error || probeStatusText(r.probe)) : (r.error || "failed");
+      var code = r.probe && r.probe.error_code ? r.probe.error_code + ": " : "";
+      return el("div", { class: "small err", text: "failed — " + code + why });
+    }
+    var bits = ["ok", "HTTP " + r.probe.status_code];
+    if (r.probe.model_served) bits.push(r.probe.model_served);
+    if (r.probe.duration_ms) bits.push(Math.round(r.probe.duration_ms / 100) / 10 + "s");
+    if (r.probe.text) bits.push(JSON.stringify(r.probe.text));
+    var line = el("div", { class: "small ok", text: bits.join(" · ") });
+    if (!r.cleared || !r.cleared.length) return line;
+    return el("div", {}, line,
+      el("div", { class: "small muted", text: "cleared its " + r.cleared.join(" and ") + " cooldown" }));
+  }
+
+  // probeStatusText describes a failure that carried no message of its own.
+  function probeStatusText(p) {
+    if (p && p.status_code) return "the backend answered HTTP " + p.status_code;
+    if (p && p.status_code === 0) return "no answer from the backend (connection or route failure)";
+    return "the backend refused it";
+  }
+
+  // testAccount probes one account with the picked model. The pool files the result
+  // and, when the account served it, clears the account's cooldown — so the account
+  // list comes back changed as well as the outcome.
+  async function testAccount(index) {
+    var model = probeModel();
+    S.probeModel = model;
+    S.probeBusy[index] = true;
+    renderShell();
+    try {
+      var data = await api("/accounts/test", { method: "POST", body: { index: index, model: model } });
+      if (data.accounts) { S.accounts = data.accounts; }
+      S.probeResults[index] = { ok: !!(data.probe && data.probe.ok), probe: data.probe, cleared: data.cleared || [] };
+    } catch (err) {
+      S.probeResults[index] = { ok: false, error: err.message };
+    }
+    S.probeBusy[index] = false;
+    renderShell();
+  }
+
+  // ensureProbeModels reads the catalogue once so the picker has real ids in it. The
+  // backend caches it, so this is one call per process at worst, and the tab redraws
+  // when the answer lands.
+  async function ensureProbeModels() {
+    if (S.probeModelsTried) return;
+    if (S.catalogue && (S.catalogue.probe_models || S.catalogue.error)) return;
+    S.probeModelsTried = true;
+    await loadModels(false);
+    if (S.tab === "accounts") renderShell();
+  }
+
+  function renderAccounts(body) {
+    clear(body);
+
+    var card = el("div", { class: "card" }, el("h2", { text: "Accounts pool" }));
+
+    if (S.accountMeta.external) {
+      card.appendChild(banner("warn", "The account pool is set by " + S.accountMeta.external +
+        ", so it cannot be edited here. Remove that setting to manage accounts from this page."));
+    }
+    if (S.accountMeta.using_cli_creds && !S.accountMeta.external) {
+      card.appendChild(banner("warn", "No accounts are in the pool: requests are using the credential the Devin CLI is signed in with. " +
+        "Add an account to spread requests over several."));
+    }
+
+    var addBtn = el("button", { class: "primary", text: "Add account (OAuth)", disabled: !!S.accountMeta.external, onclick: openAddAccount });
+    var pasteBtn = el("button", { text: "Add token", disabled: !!S.accountMeta.external, onclick: openAddToken });
+    var refreshBtn = el("button", { text: "Check all status", onclick: function () { checkStatus(null); } });
+    card.appendChild(el("div", { class: "row" }, addBtn, pasteBtn, refreshBtn, probeModelPicker()));
+    card.appendChild(el("div", { class: "small muted", style: "margin-top:.35rem" },
+      "Test sends one very short, real completion through that account and, when the backend serves it, clears any " +
+      "cooldown the account is under. It spends a little of that account's quota — a status check does not, a test does."));
+
+    var tbody = el("tbody");
+    if (!S.accounts.length) {
+      tbody.appendChild(el("tr", {}, el("td", { colspan: 6, class: "muted", text: "no accounts" })));
+    }
+    S.accounts.forEach(function (a) {
+      tbody.appendChild(el("tr", {},
+        el("td", { class: "muted small", text: String(a.index + 1) }),
+        el("td", {},
+          el("div", { text: accountLabel(a) }),
+          // The tail is only worth a second line when the label above it is an
+          // identity. When there is no status yet the label already is the tail.
+          hasIdentity(a) ? el("div", { class: "muted small mono", text: "…" + a.tail }) : null
+        ),
+        el("td", { class: "small muted mono trunc", text: (a.source || "") }),
+        el("td", {}, quotaCell(a)),
+        el("td", {}, accountState(a)),
+        el("td", {},
+          el("div", { class: "row", style: "gap:.3rem" },
+            el("button", { class: "small", text: "check", disabled: !!S.accountMeta.external || S.accountMeta.using_cli_creds, onclick: function () { checkStatus(a.index); } }),
+            el("button", {
+              class: "small", text: S.probeBusy[a.index] ? "testing…" : "test",
+              disabled: !!S.probeBusy[a.index] || S.accountMeta.using_cli_creds,
+              title: "Send one short real completion through this account, using the model id picked above",
+              onclick: function () { testAccount(a.index); }
+            }),
+            el("button", { class: "small danger", text: "delete", disabled: !!S.accountMeta.external, onclick: function () { deleteAccount(a); } })
+          ),
+          probeNote(a.index)
+        )
+      ));
+    });
+
+    card.appendChild(el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "#" }), el("th", { text: "account" }), el("th", { text: "source" }),
+        el("th", { text: "plan / quota" }), el("th", { text: "state" }), el("th", { text: "" })
+      )),
+      tbody
+    ));
+
+    body.appendChild(card);
+    if (S.accountMeta.backend) {
+      body.appendChild(el("div", { class: "card" },
+        el("h2", { text: "Backend" }),
+        el("dl", { class: "kv" },
+          el("dt", { text: "api server" }), el("dd", { text: S.accountMeta.backend }),
+          el("dt", { text: "local address" }), el("dd", { text: (S.info && S.info.addr) || "" }),
+          el("dt", { text: "models" }), el("dd", { text: ((S.info && S.info.models) || []).join(", ") }),
+          el("dt", { text: "started" }), el("dd", { text: (S.info && fmtTime(S.info.started)) || "" })
+        )
+      ));
+    }
+
+    // Deliberately not awaited: the table is already drawn, and the quota column
+    // fills itself in when the answers land.
+    autoCheckStatusOnce();
+    ensureProbeModels();
+  }
+
+  // ---------------------------------------------------------------- models
+
+  // renderModels shows what this proxy answers to at /v1, and what the backend's
+  // model catalogue says those models can do.
+  //
+  // The catalogue is the unary GetCliModelConfigs call the Devin CLI makes at
+  // startup, asked for as the CLI asks for it, and it is where the context window,
+  // output limit, tokenizer and price come from: numbers no client's documentation
+  // states, and which a gateway that only knew its own config could not show at all.
+  // It costs no chat quota. The panel reads it the first time this tab is opened and
+  // then reuses it, so switch to another tab and back without asking the backend
+  // again.
+  function renderModels(body) {
+    clear(body);
+    var info = S.info || {};
+    var data = S.catalogue;
+
+    var served = el("div", { class: "card" }, el("h2", { text: "Served at /v1" }));
+    served.appendChild(el("div", { class: "small muted", style: "margin-bottom:.5rem" },
+      "The model ids a client may ask for. A name this proxy does not know is served by the default rather than " +
+      "refused, because clients routinely send whatever model string they were configured with."));
+
+    var byUID = {};
+    ((data && data.details) || []).forEach(function (m) { byUID[m.uid] = m; });
+
+    // Before the catalogue has been read there is still a served list to draw: the
+    // configured ids and the default they resolve to, which need no network call.
+    var list = (data && data.served) || (info.models || []).map(function (id) {
+      return { id: id, uid: info.model, default: id === info.model, alias: id !== info.model };
+    });
+
+    var rows = el("tbody");
+    // Whether a uid is missing from the catalogue can only be said once a catalogue
+    // has actually been read: with a failed read every uid would look missing.
+    var checked = !!(data && data.catalogue_size);
+    list.forEach(function (s) {
+      rows.appendChild(el("tr", {},
+        el("td", { class: "mono", text: s.id }),
+        el("td", { class: "small mono", text: s.uid && s.uid !== s.id ? s.uid : "" }),
+        el("td", {}, servedRole(s, byUID[s.uid], checked))
+      ));
+    });
+    served.appendChild(el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "id" }), el("th", { text: "resolves to" }), el("th", { text: "role" })
+      )),
+      rows
+    ));
+    body.appendChild(served);
+
+    var cat = el("div", { class: "card" }, el("h2", { text: "What the backend says about them" }));
+    body.appendChild(cat);
+
+    if (!data) {
+      cat.appendChild(el("div", { class: "muted small", text: "reading the model catalogue…" }));
+      loadModels(false);
+      return;
+    }
+    if (data.error) {
+      cat.appendChild(banner("warn", "The catalogue could not be read: " + data.error +
+        (data.fetched ? " Showing what was read at " + fmtClock(data.fetched) + "." : "")));
+    }
+    if (!data.fetched) {
+      cat.appendChild(el("div", { class: "row", style: "margin-top:.4rem" }, refreshModelsButton()));
+      return;
+    }
+
+    cat.appendChild(el("div", { class: "small muted", style: "margin-bottom:.6rem" },
+      "Read from the backend's model catalogue (GetCliModelConfigs, the call the Devin CLI makes at startup) as the " +
+      "CLI asks for it, so these are the numbers the backend itself reports. " +
+      data.catalogue_size + " models in the catalogue; " + (data.available || []).length +
+      ((data.available || []).length === 1 ? " of them is not gated behind a higher plan"
+                                           : " of them are not gated behind a higher plan") +
+      (data.account ? " — read with the account ending " + data.account : "") + "."));
+
+    var shown = {};
+    (data.details || []).forEach(function (m) {
+      shown[m.uid] = true;
+      cat.appendChild(modelBlock(m));
+    });
+    list.forEach(function (s) {
+      if (!s.in_catalogue) {
+        cat.appendChild(el("div", { class: "small muted", style: "margin-bottom:.6rem", text: s.id +
+          " is not in the catalogue the backend returned, so there are no limits to show for it." }));
+      }
+    });
+
+    // Anything this plan does not gate that is not already detailed above. On a free
+    // account there is nothing here, because the one usable model is the one served.
+    var others = (data.available || []).filter(function (m) { return !shown[m.uid]; });
+    if (others.length) {
+      var orows = el("tbody");
+      others.forEach(function (m) {
+        orows.appendChild(el("tr", {},
+          el("td", {}, el("div", { text: m.name || m.uid }), el("div", { class: "muted small mono", text: m.uid })),
+          el("td", { class: "small", text: tokensCell(m.context_window) }),
+          el("td", { class: "small", text: tokensCell(m.max_output) })
+        ));
+      });
+      cat.appendChild(el("div", { class: "small", style: "margin:.8rem 0 .3rem", text: "Also available on this plan" }));
+      cat.appendChild(el("table", {},
+        el("thead", {}, el("tr", {},
+          el("th", { text: "model" }), el("th", { text: "context window" }), el("th", { text: "max output" })
+        )),
+        orows
+      ));
+    }
+
+    cat.appendChild(el("div", { class: "row", style: "margin-top:.7rem" },
+      refreshModelsButton(),
+      el("span", { class: "muted small", text: "read " + ago(data.fetched) })
+    ));
+  }
+
+  // servedRole says why a client asking for this id gets what it gets. A model the
+  // account's plan gated is called out here rather than only in a failed request.
+  function servedRole(s, detail, checked) {
+    var chips = [];
+    if (s.default) chips.push(el("span", { class: "chip k", text: "default" }));
+    if (s.alias) chips.push(el("span", { class: "chip", text: "alias of " + s.uid }));
+    if (s.forwarded) chips.push(el("span", { class: "chip", text: "passed through when named" }));
+    if (checked && s.in_catalogue === false) {
+      chips.push(el("span", { class: "chip warn", text: "not in the catalogue" }));
+    } else if (detail) {
+      chips.push(detail.plan_gated
+        ? el("span", { class: "chip err", text: "gated behind a higher plan" })
+        : el("span", { class: "chip ok", text: "available on this plan" }));
+    }
+    if (!chips.length) chips.push(el("span", { class: "muted small", text: "—" }));
+    return el("div", { class: "row", style: "gap:.25rem" }, chips);
+  }
+
+  // modelBlock is one catalogue entry: what the model is, what it can take, and what
+  // it costs.
+  function modelBlock(m) {
+    var chips = [];
+    if (m.plan_gated) chips.push(el("span", { class: "chip err", text: "gated behind a higher plan" }));
+    else chips.push(el("span", { class: "chip ok", text: "available on this plan" }));
+    (m.options || []).forEach(function (o) { chips.push(el("span", { class: "chip", text: o })); });
+
+    var prices = (m.prices || []).map(function (p) {
+      return el("span", { class: "chip", text: priceText(p) });
+    });
+
+    return el("div", { style: "border-top:1px solid var(--line); padding-top:.6rem; margin-bottom:.9rem" },
+      el("div", { class: "row spread", style: "margin-bottom:.4rem" },
+        el("div", {},
+          el("div", { text: m.name || m.uid }),
+          el("div", { class: "muted small mono", text: m.uid })
+        ),
+        el("div", { class: "row", style: "gap:.25rem" }, chips)
+      ),
+      el("dl", { class: "kv" },
+        el("dt", { text: "context window" }), el("dd", { text: tokensCell(m.context_window) }),
+        el("dt", { text: "max output" }), el("dd", { text: tokensCell(m.max_output) }),
+        m.tokenizer ? el("dt", { text: "tokenizer" }) : null,
+        m.tokenizer ? el("dd", { text: m.tokenizer }) : null,
+        (m.aliases || []).length ? el("dt", { text: "catalogue aliases" }) : null,
+        (m.aliases || []).length ? el("dd", { text: m.aliases.join(", ") }) : null,
+        (m.capabilities || []).length ? el("dt", { text: "capability flags" }) : null,
+        // Kept as the raw set: which bit means what is not established, and a guess
+        // here would read as a specification.
+        (m.capabilities || []).length ? el("dd", { text: m.capabilities.join(" ") }) : null
+      ),
+      prices.length ? el("div", { class: "row", style: "margin-top:.45rem;gap:.25rem" }, prices) : null,
+      priceNotes(m.prices)
+    );
+  }
+
+  function priceText(p) {
+    var parts = [p.label || "?"];
+    if (p.amount) parts.push(trimNumber(p.amount));
+    if (p.unit) parts.push("per " + p.unit);
+    if (p.tag) parts.push("[" + p.tag + "]");
+    return parts.join(" ");
+  }
+
+  // trimNumber drops the float noise the backend's fixed32 values carry
+  // (0.20000000298023224 is 0.2 as a float32), without rounding the price itself.
+  function trimNumber(n) {
+    return String(Number(Number(n).toPrecision(3)));
+  }
+
+  function priceNotes(prices) {
+    var notes = [];
+    (prices || []).forEach(function (p) {
+      if (p.note && notes.indexOf(p.note) < 0) notes.push(p.note);
+    });
+    if (!notes.length) return null;
+    return el("div", { class: "muted small", style: "margin-top:.3rem", text: notes.join(" · ") });
+  }
+
+  function tokensCell(n) {
+    if (!n) return "—";
+    return fmtTokens(n) + " tokens";
+  }
+
+  function refreshModelsButton() {
+    return el("button", {
+      class: "small",
+      text: S.catalogue && S.catalogue.fetched ? "Read again" : "Read the catalogue",
+      onclick: function () { loadModels(true); }
+    });
+  }
+
+  async function loadModels(refresh) {
+    try {
+      S.catalogue = await api("/models" + (refresh ? "?refresh=1" : ""));
+    } catch (err) {
+      S.catalogue = { error: err.message };
+    }
+    if (S.tab === "models") renderShell();
+  }
+
+  async function loadAccounts() {
+    var data = await api("/accounts");
+    S.accounts = data.accounts || [];
+    S.accountMeta = data;
+    delete S.accountMeta.accounts;
+  }
+
+  async function checkStatus(index, quiet) {
+    try {
+      var data = await api("/accounts/status", { method: "POST", body: index === null ? { all: true } : { index: index } });
+      if (data.accounts) { S.accounts = data.accounts; }
+      else { await loadAccounts(); }
+      renderShell();
+    } catch (err) {
+      // A check the page started by itself must not throw a dialog at someone who
+      // never asked for it: the row says "unknown" either way.
+      if (!quiet) window.alert(err.message);
+    }
+  }
+
+  // The pool only knows an account's plan and quota once a status call has been
+  // made, so the Accounts tab makes one for the whole pool the first time it is
+  // drawn. Otherwise the quota column reads "unknown" until someone finds the
+  // Check all status button, which is a poor way to show an operator their own
+  // quota. Once per page load, and never more: it is a real round trip per account.
+  async function autoCheckStatusOnce() {
+    if (S.statusAutoChecked || !S.accounts.length) return;
+    if (!S.accounts.some(function (a) { return !a.status && !a.status_pending; })) return;
+    S.statusAutoChecked = true;
+    await checkStatus(null, true);
+  }
+
+  async function deleteAccount(a) {
+    var label = accountLabel(a);
+    if (!window.confirm("Remove " + label + " from the pool?\n\nThis only forgets the account here; it does not sign it out of Devin.")) return;
+    try {
+      var data = await api("/accounts/delete", { method: "POST", body: { index: a.index } });
+      S.accounts = data.accounts || [];
+      renderShell();
+    } catch (err) { window.alert(err.message); }
+  }
+
+  function openModal(title) {
+    var box = el("div", { class: "modal" });
+    var inner = el("div", {}, el("h1", { text: title }));
+    box.appendChild(inner);
+    box.addEventListener("click", function (e) { if (e.target === box) close(); });
+    function close() { clear(box); document.body.removeChild(box); }
+    document.body.appendChild(box);
+    return { box: box, inner: inner, close: close };
+  }
+
+  function openAddToken() {
+    var m = openModal("Add an account by token");
+    m.inner.appendChild(el("div", { class: "small muted", style: "margin:.4rem 0 .7rem" },
+      "Paste a devin-session-token$… value. It is stored in the dashboard's own file (0600, gitignored); " +
+      "the same value is what the CLI writes to its credentials file after a login."));
+    m.inner.appendChild(el("div", { class: "small muted", style: "margin:0 0 .7rem" },
+      "This takes a token, not the code from a sign-in page: a code is only good for the sign-in that " +
+      "produced it, and that sign-in's secret is held by the proxy. Use Add account (OAuth) for a code."));
+    var ta = el("textarea", { placeholder: "devin-session-token$…", style: "min-height:6rem" });
+    var msg = el("div");
+    var save = el("button", { class: "primary", text: "Add" });
+    save.addEventListener("click", async function () {
+      save.disabled = true;
+      clear(msg);
+      try {
+        var data = await api("/accounts/add", { method: "POST", body: { token: ta.value } });
+        if (data.warning) msg.appendChild(banner("warn", data.warning));
+        await loadAccounts();
+        m.close();
+        renderShell();
+      } catch (err) {
+        msg.appendChild(banner("err", err.message));
+        save.disabled = false;
+      }
+    });
+    m.inner.appendChild(ta);
+    m.inner.appendChild(el("div", { class: "row", style: "margin-top:.7rem" }, save, el("button", { text: "Cancel", onclick: m.close })));
+    m.inner.appendChild(msg);
+    ta.focus();
+  }
+
+  // Adding an account: press the button, sign in on the page that opens, paste the
+  // code back. The exchange happens in the proxy, so the Devin CLI is not involved
+  // and does not need to be installed — which also means this works from a remote
+  // browser, where a CLI on the proxy's own machine is no use at all.
+  function openAddAccount() {
+    var m = openModal("Add a Devin account");
+    m.inner.appendChild(el("div", { class: "small muted", style: "margin:.4rem 0 .7rem" },
+      "Press Start sign-in, choose the account to add on the page that opens, then paste the code " +
+      "Devin shows into the box below and press Add this account."));
+
+    var msg = el("div");
+    var linkRow = el("div", { class: "row", style: "margin-top:.5rem" });
+    var flow = { state: "", url: "" };
+
+    var startBtn = el("button", { class: "primary", text: "Start sign-in" });
+    var codeInput = el("input", { class: "grow", placeholder: "paste the code from the sign-in page" });
+    // Not "Add account": that is the name of the button on the panel behind this
+    // dialog, and two controls with one name is one control too many — for a screen
+    // reader, and for anything else that has to find one of them.
+    var finishBtn = el("button", { class: "primary", text: "Add this account" });
+
+    function showLink(url) {
+      clear(linkRow);
+      linkRow.appendChild(el("a", { href: url, target: "_blank", rel: "noreferrer", class: "mono small", style: "overflow-wrap:anywhere", text: url }));
+    }
+
+    startBtn.addEventListener("click", async function () {
+      clear(msg);
+      startBtn.disabled = true;
+      try {
+        var data = await api("/accounts/oauth/start", { method: "POST" });
+        flow.state = data.state;
+        flow.url = data.url;
+        // Opened as a link rather than window.open: a popup blocker is the operator's
+        // browser making a reasonable decision, and a link cannot be blocked.
+        showLink(data.url);
+        startBtn.textContent = "Start again";
+        startBtn.disabled = false;
+        msg.appendChild(banner("info", "Choose the account you want to add at the account picker — otherwise " +
+          "the browser reuses the one already signed in. Then paste the code the page shows into the box above."));
+        codeInput.focus();
+      } catch (err) {
+        msg.appendChild(banner("err", err.message));
+        startBtn.disabled = false;
+      }
+    });
+
+    finishBtn.addEventListener("click", async function () {
+      var code = codeInput.value.trim();
+      if (!code) { codeInput.focus(); return; }
+      finishBtn.disabled = true;
+      clear(msg);
+      try {
+        var data = await api("/accounts/oauth/finish", { method: "POST", body: { state: flow.state, code: code } });
+        await loadAccounts();
+        renderShell();
+        m.close();
+      } catch (err) {
+        // The usual failures are an expired code and a code that was already used,
+        // both of which are fixed by starting again — so the button is left ready.
+        msg.appendChild(banner("err", err.message));
+        finishBtn.disabled = false;
+      }
+    });
+    codeInput.addEventListener("keydown", function (ev) { if (ev.key === "Enter") finishBtn.click(); });
+
+    // The code box and its button are always here, from the moment the dialog opens.
+    // Hiding them until a sign-in started read as "there is nowhere to put the code":
+    // the sign-in happens in another tab, and a page reloaded while you are over
+    // there comes back to a dialog that had no box in it at all. A code pasted
+    // without a sign-in in progress gets the backend's answer — that it is not
+    // waiting for one, or that the code is no longer valid — which is a better
+    // message than an empty dialog.
+    m.inner.appendChild(el("div", { class: "card small", style: "margin:0 0 .6rem" },
+      el("div", { class: "row" }, startBtn),
+      linkRow,
+      el("div", { class: "row", style: "margin-top:.6rem" }, codeInput, finishBtn)
+    ));
+    m.inner.appendChild(msg);
+    m.inner.appendChild(el("div", { class: "row" }, el("button", { text: "Close", onclick: function () { m.close(); } })));
+
+    // Less prominent ways in, still here because they are sometimes the only ones
+    // that work: a token pasted by hand, and the account the CLI on this machine is
+    // signed in with.
+    m.inner.appendChild(el("div", { class: "card small", style: "margin:.7rem 0 0" },
+      el("div", { class: "muted", text: "Other ways to add an account:" }),
+      el("div", { class: "row", style: "margin-top:.5rem" },
+        el("button", { text: "Paste a token", onclick: function () { m.close(); openAddToken(); } }),
+        el("button", { text: "Use the account the CLI is signed in with", onclick: function () { m.close(); openUseCLIAccount(); } })
+      )
+    ));
+  }
+
+  // openUseCLIAccount handles the account already on this machine: it can be taken
+  // into the pool as it is, and signing the CLI out is a separate, reversible step
+  // for when somebody wants a different account there.
+  function openUseCLIAccount() {
+    var m = openModal("The CLI's own account");
+    var msg = el("div");
+
+    var captureBtn = el("button", { class: "primary", text: "Take the signed-in account" });
+    captureBtn.addEventListener("click", async function () {
+      captureBtn.disabled = true;
+      clear(msg);
+      try {
+        await api("/accounts/capture", { method: "POST" });
+        await loadAccounts();
+        renderShell();
+        m.close();
+      } catch (err) {
+        msg.appendChild(banner("err", err.message));
+        captureBtn.disabled = false;
+      }
+    });
+
+    var signOutBtn = el("button", { class: "danger", text: "Sign the CLI out" });
+    var signOutOut = el("pre", { class: "term small", style: "display:none; max-height:9rem" });
+    signOutBtn.addEventListener("click", async function () {
+      if (!window.confirm("Sign the Devin CLI out?\n\nThe account it is signed in with is copied into the pool first, " +
+        "so requests keep working — but the CLI itself will have no account until you sign in again.")) return;
+      signOutBtn.disabled = true;
+      clear(msg);
+      try {
+        var data = await api("/accounts/logout", { method: "POST" });
+        S.accounts = data.accounts || [];
+        signOutOut.textContent = (data.output || []).join("\n") || "signed out";
+        signOutOut.style.display = "block";
+        signOutBtn.textContent = "CLI signed out";
+        await loadAccounts();
+        renderShell();
+      } catch (err) {
+        msg.appendChild(banner("err", err.message));
+        signOutBtn.disabled = false;
+      }
+    });
+
+    var cmd = (S.accountMeta && S.accountMeta.sign_in_command) || "devin auth login --force-manual-token-flow";
+    m.inner.appendChild(el("div", { class: "small muted", style: "margin:.4rem 0 .7rem" },
+      "For the account the Devin CLI on this machine is already signed in with. Nothing is written to the CLI's " +
+      "configuration; it is only read."));
+    m.inner.appendChild(el("div", { class: "card small", style: "margin:0 0 .6rem" },
+      el("div", { class: "row" }, captureBtn)
+    ));
+    m.inner.appendChild(el("div", { class: "card small", style: "margin:0 0 .6rem" },
+      el("div", { text: "Signing the CLI out is only needed to sign it in as somebody else there. Its account is copied into the pool first, so this cannot lose it." }),
+      el("div", { class: "row", style: "margin-top:.5rem" }, signOutBtn),
+      el("div", { class: "muted", style: "margin-top:.5rem", text: "To sign it in again, run in a terminal: " + cmd })
+    ));
+    m.inner.appendChild(el("div", { class: "row" }, el("button", { text: "Close", onclick: m.close })));
+    m.inner.appendChild(signOutOut);
+    m.inner.appendChild(msg);
+  }
+
+  // --------------------------------------------------------------- proxies
+
+  function renderProxies(body) {
+    clear(body);
+    var card = el("div", { class: "card" }, el("h2", { text: "Proxy pool" }));
+    var panel = S.proxyPanel || { routes: [], count: 0, available: 0 };
+    var external = panel.external || "";
+
+    if (external) {
+      card.appendChild(banner("warn", "The route list is set by " + external + ", so it cannot be edited here."));
+    }
+    if (panel.direct) {
+      card.appendChild(banner("warn", panel.direct));
+    }
+
+    var ta = el("textarea", {
+      placeholder: "socks5://user:pass@host:port\nsocks5://host:port\nhttp://host:port\ndirect",
+      disabled: !!external
+    });
+    ta.value = (S.proxyText !== null ? S.proxyText : (panel.specs || []).join("\n"));
+    ta.addEventListener("input", function () { S.proxyText = ta.value; });
+
+    var save = el("button", { class: "primary", text: "Save routes", disabled: !!external });
+    var testAll = el("button", { text: "Test each route" });
+    var reload = el("button", { text: "Reload", onclick: async function () { S.proxyText = null; await loadProxies(); renderShell(); } });
+    var msg = el("div", { style: "margin-top:.6rem" });
+
+    save.addEventListener("click", async function () {
+      save.disabled = true;
+      clear(msg);
+      try {
+        var data = await api("/proxies", { method: "POST", body: { text: ta.value } });
+        S.probes = {};
+        S.proxyText = null;
+        await loadProxies();
+        renderShell();
+      } catch (err) {
+        msg.appendChild(banner("err", err.message));
+        save.disabled = false;
+      }
+    });
+
+    testAll.addEventListener("click", async function () {
+      testAll.disabled = true;
+      var specs = splitPasted(ta.value);
+      // One at a time, deliberately: a probe opens a tunnel to the backend, and
+      // firing twenty at once would look like the load this dashboard exists to
+      // avoid. Each result appears as it lands.
+      for (var i = 0; i < specs.length; i++) {
+        renderProbeProgress(msg, i + 1, specs.length, specs[i]);
+        try { S.probes[i] = (await api("/proxies/test", { method: "POST", body: { spec: specs[i] } })).probe; }
+        catch (err) { S.probes[i] = { spec: specs[i], ok: false, error: err.message }; }
+        if (S.tab === "proxies") renderShell();
+      }
+      testAll.disabled = false;
+      if (S.tab === "proxies") renderShell();
+    });
+
+    card.appendChild(ta);
+    card.appendChild(el("div", { class: "row", style: "margin-top:.6rem" }, save, testAll, reload));
+    // The mask is a <code> element, so it is appended rather than concatenated into
+    // the surrounding text: a node joined into a string is not markup, it is that
+    // node's own string form, printed on the page verbatim.
+    card.appendChild(el("div", { class: "small muted", style: "margin-top:.5rem" },
+      "One route per line, # starts a comment. socks5:// and socks5h://, http:// and https:// (CONNECT), or direct. " +
+      "Saving replaces the whole list for subsequent requests; requests already in flight keep the route they started on. " +
+      "Any password a route was configured with is shown here as ",
+      el("code", { text: "***:***" }),
+      " — the real one never reaches this page, and leaving the mask in place keeps it."));
+    card.appendChild(msg);
+
+    var tbody = el("tbody");
+    // The list is defaulted rather than trusted: the field is a JSON array, and an
+    // absent or null one used to throw here and blank the whole panel.
+    var routes = panel.routes || [];
+    if (!routes.length) {
+      tbody.appendChild(el("tr", {}, el("td", { colspan: 5, class: "muted", text: "no routes configured" })));
+    }
+    routes.forEach(function (rt) {
+      var probe = S.probes[rt.index];
+      tbody.appendChild(el("tr", {},
+        el("td", { class: "muted small", text: String(rt.index + 1) }),
+        el("td", { class: "mono small trunc", text: rt.spec || rt.label }),
+        el("td", {},
+          rt.available ? el("span", { class: "chip ok", text: "ready" })
+            : el("span", { class: "chip err", text: "cooling " + until(rt.cooling_until) }),
+          rt.last_served ? el("span", { class: "chip k", text: "last used" }) : null
+        ),
+        el("td", { class: "small" }, probe
+          ? (probe.ok
+            ? el("span", { class: "chip ok", text: "ok" + (probe.exit_ip ? " · " + probe.exit_ip : "") + " · " + probe.latency_ms + "ms" })
+            : el("span", { class: "chip err", text: probe.error || "failed" }))
+          : el("span", { class: "muted", text: "—" })),
+        el("td", {}, el("button", { class: "small", text: "test", onclick: function () { testOne(rt.index); } }))
+      ));
+    });
+
+    card.appendChild(el("table", {},
+      el("thead", {}, el("tr", {},
+        el("th", { text: "#" }), el("th", { text: "route" }), el("th", { text: "state" }),
+        el("th", { text: "last test" }), el("th", { text: "" })
+      )),
+      tbody
+    ));
+    body.appendChild(card);
+  }
+
+  function renderProbeProgress(out, i, n, spec) {
+    clear(out);
+    out.appendChild(el("span", { class: "small muted", text: "testing " + i + "/" + n + ": " + spec }));
+  }
+
+  function splitPasted(text) {
+    return text.split("\n").map(function (s) { return s.trim(); })
+      .filter(function (s) { return s && s[0] !== "#"; });
+  }
+
+  async function testOne(index) {
+    try {
+      var data = await api("/proxies/test", { method: "POST", body: { index: index } });
+      S.probes[index] = data.probe;
+      renderShell();
+    } catch (err) { window.alert(err.message); }
+  }
+
+  async function loadProxies() {
+    S.proxyPanel = await api("/proxies");
+  }
+
+  // ------------------------------------------------------------------ logs
+
+  function logMatches(e) {
+    var f = S.logFilter;
+    if (f.kind && e.kind !== f.kind) return false;
+    if (f.level && e.level !== f.level) return false;
+    if (f.q) {
+      var hay = [e.message, e.error, e.path, e.method, e.model, e.account, e.route, e.code, e.status]
+        .filter(Boolean).join(" ").toLowerCase();
+      if (hay.indexOf(f.q.toLowerCase()) < 0) return false;
+    }
+    return true;
+  }
+
+  function logRow(e) {
+    var kind = e.kind || "log";
+    var head = e.method ? (e.method + " " + (e.path || "")) : kind;
+    var line = el("div", { class: "log " + (e.level || "info") },
+      el("div", { class: "t", text: fmtTime(e.time) }),
+      el("div", { class: "lvl", text: e.level || "info" }),
+      el("div", { class: "trunc muted", text: head, title: head })
+    );
+    var msg = el("div", { class: "msg" });
+    var bits = [];
+    if (e.status) bits.push(String(e.status));
+    if (e.code) bits.push(e.code);
+    if (e.account) bits.push("acct " + e.account);
+    if (e.route) bits.push("route " + e.route);
+    if (e.model) bits.push(e.model);
+    if (e.duration_ms) bits.push(e.duration_ms + "ms");
+    if (e.stream) bits.push("stream");
+    if (e.finish) bits.push("finish:" + e.finish);
+    if (e.tokens_in || e.tokens_out) bits.push("tok " + (e.tokens_in || 0) + "/" + (e.tokens_out || 0));
+    if (bits.length) msg.appendChild(el("div", { class: "muted", text: bits.join(" · ") }));
+    if (e.message) msg.appendChild(el("div", { text: e.message }));
+    if (e.error) msg.appendChild(el("div", { class: "err", text: e.error }));
+    line.appendChild(msg);
+    return line;
+  }
+
+  function renderLogs(body) {
+    clear(body);
+    var card = el("div", { class: "card" }, el("h2", { text: "Logs" }));
+
+    var q = el("input", { class: "grow", placeholder: "filter by text (path, account, error…)", value: S.logFilter.q });
+    q.addEventListener("input", function () { S.logFilter.q = q.value; redrawLogs(); });
+    var kind = el("select", { style: "width:auto" },
+      el("option", { value: "", text: "all kinds" }),
+      el("option", { value: "request", text: "requests" }),
+      el("option", { value: "log", text: "gateway log" })
+    );
+    kind.value = S.logFilter.kind;
+    kind.addEventListener("change", function () { S.logFilter.kind = kind.value; redrawLogs(); });
+    var level = el("select", { style: "width:auto" },
+      el("option", { value: "", text: "all levels" }),
+      el("option", { value: "info", text: "info" }),
+      el("option", { value: "warn", text: "warn" }),
+      el("option", { value: "error", text: "error" })
+    );
+    level.value = S.logFilter.level;
+    level.addEventListener("change", function () { S.logFilter.level = level.value; redrawLogs(); });
+    var pause = el("button", { text: S.logsPaused ? "Resume" : "Pause", onclick: function () { S.logsPaused = !S.logsPaused; renderShell(); } });
+    var clearBtn = el("button", { text: "Clear", onclick: function () { S.logs = []; redrawLogs(); renderStats(); } });
+
+    card.appendChild(el("div", { class: "row" }, q, kind, level, pause, clearBtn));
+
+    var view = el("div", { class: "logs", id: "logview", style: "margin-top:.7rem" });
+    var marker = el("div", { class: "small muted", id: "logmarker", style: "margin-top:.4rem" });
+    card.appendChild(view);
+    card.appendChild(marker);
+    body.appendChild(card);
+    body.appendChild(el("div", { class: "card" },
+      el("h2", { text: "Stream" }),
+      el("div", { class: "small muted" },
+        "Live view of requests through this proxy and of the gateway's own log, newest first — the latest line " +
+        "is already at the top, so there is nothing to scroll for. A request line carries the upstream " +
+        "HTTP status and the backend's own error text, so a refusal that arrives as HTTP 200 is still visible here. " +
+        "The view refreshes every 3 seconds and keeps the newest 200 events; older ones fall off as new ones " +
+        "arrive. Addresses and routes are shown; credentials never are.")
+    ));
+    redrawLogs();
+  }
+
+  function redrawLogs() {
+    var view = $("logview");
+    if (!view) return;
+    clear(view);
+    // Newest first: the page draws what is already newest-first, so the latest
+    // line is on top and there is nothing to scroll for.
+    var shown = S.logs.filter(logMatches);
+    if (!shown.length) {
+      // A class of its own, not "log info": a real info-level row has that class
+      // too, so an arriving event would have wiped the whole view as if it were
+      // clearing the placeholder.
+      view.appendChild(el("div", { class: "log log-empty" }, el("div", { class: "muted", text: "nothing to show" })));
+      updateLogMarker(shown.length);
+      return;
+    }
+    shown.forEach(function (e) { view.appendChild(logRow(e)); });
+    updateLogMarker(shown.length);
+  }
+
+  // updateLogMarker keeps the "N of M events" line honest. It used to be written
+  // only on a redraw, so it sat at its old value while the stream kept appending.
+  function updateLogMarker(shown) {
+    var marker = $("logmarker");
+    if (!marker) return;
+    var matched = shown === undefined ? S.logs.filter(logMatches).length : shown;
+    marker.textContent = matched + " of " + S.logs.length + " events" +
+      (S.logsPaused ? " (paused; the stream keeps running)" : "") +
+      (S.dropped ? " · " + S.dropped + " dropped for a slow reader" : "");
+  }
+
+  // logCap is how many events the view keeps. Older ones are pruned as new ones
+  // arrive, so the list never grows while it is watched — the newest 200 stay,
+  // the rest fall off. It matches the recent endpoint's own cap, so a poll can
+  // never hand back more than fits.
+  var logCap = 200;
+
+  // logPollMS is how often the Logs view asks for the latest events. The old
+  // view held a streaming connection open; a poll every three seconds is a
+  // small, predictable load instead of a second connection per open page, and a
+  // page left open in a background tab costs one tiny read rather than a held
+  // socket. Nothing on this view needs to be fresher than that.
+  var logPollMS = 3000;
+
+  function startStream() {
+    if (!S.info) return;
+    stopStream();
+    pollLogs();
+    // The timer holds no connection between polls: each run is one short
+    // request, so overlapping is impossible and a missed tick just means the
+    // next one is three seconds later.
+    S.logTimer = window.setInterval(pollLogs, logPollMS);
+  }
+
+  // pollLogs asks for the newest events and merges them in. The endpoint answers
+  // newest-first, so the merge only has to take the head the page has not seen.
+  async function pollLogs() {
+    var data;
+    try {
+      data = await api("/logs/recent?limit=200");
+    } catch (err) {
+      if (err.status === 401) { stopStream(); await boot(); }
+      return;
+    }
+    if (typeof data.dropped === "number") S.dropped = data.dropped;
+    var fresh = data.events || [];
+    var seen = {};
+    S.logs.forEach(function (e) { seen[e.seq] = true; });
+    var added = false;
+    // Walked back to front so the unshift keeps the page newest-first: the
+    // oldest unseen event goes in first, the newest last, and it lands on top.
+    for (var i = fresh.length - 1; i >= 0; i--) {
+      if (!seen[fresh[i].seq]) { S.logs.unshift(fresh[i]); added = true; }
+    }
+    if (S.logs.length > logCap) S.logs.length = logCap;
+    if (added || !S.logsPolledOnce) renderStats();
+    S.logsPolledOnce = true;
+    if (S.tab === "logs" && !S.logsPaused) redrawLogs();
+    else updateLogMarker();
+  }
+
+  // stopStream stops everything that ticks while a session is alive. The
+  // overview timer belongs here as much as the log poll does: signing out used
+  // to leave it running, so a logged-out page kept asking /overview every 15s,
+  // each 401 re-entered boot(), and the login form was redrawn out from under
+  // whatever the operator had already typed.
+  function stopStream() {
+    if (S.logTimer) { window.clearInterval(S.logTimer); S.logTimer = null; }
+    if (S.overviewTimer) { window.clearInterval(S.overviewTimer); S.overviewTimer = null; }
+  }
+
+  // ------------------------------------------------------------------- boot
+
+  async function refreshOverview() {
+    try {
+      var data = await api("/overview");
+      S.info = data.info;
+      S.dropped = (data.events && data.events.dropped) || 0;
+      renderStats();
+    } catch (err) {
+      if (err.status === 401) { stopStream(); await boot(); }
+    }
+  }
+
+  async function boot() {
+    try {
+      S.session = await api("/session");
+    } catch (err) {
+      $("root").textContent = "cannot reach the dashboard: " + err.message;
+      return;
+    }
+    if (!S.session.configured || !S.session.authenticated) {
+      stopStream();
+      renderLogin();
+      return;
+    }
+    try {
+      await Promise.all([loadAccounts(), loadProxies(), refreshOverview()]);
+    } catch (err) {
+      if (err.status === 401) { stopStream(); renderLogin(); return; }
+      $("root").textContent = "cannot load the dashboard: " + err.message;
+      return;
+    }
+    renderShell();
+    startStream();
+    if (S.overviewTimer) window.clearInterval(S.overviewTimer);
+    // A gentle refresh: the counts in the header should not drift while a page sits
+    // open, but this is nowhere near the request path, so it is cheap.
+    S.overviewTimer = window.setInterval(async function () {
+      await refreshOverview();
+      try { await loadProxies(); } catch (e) { /* header numbers only */ }
+      renderStats();
+    }, 15000);
+  }
+
+  boot();
+})();
+</script>
+</body>
+</html>
+
+
+
+
