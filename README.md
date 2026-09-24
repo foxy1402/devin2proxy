@@ -46,9 +46,8 @@ You need:
 
 In Portainer: **Stacks → Add stack → Web editor**, paste the whole block
 below, then in the same screen's **Environment variables** section add the
-four values it references (`DEVIN2PROXY_API_KEY`, `DEVIN_TOKEN`,
-`DEVIN2PROXY_DASHBOARD_PASSWORD`, and optionally `DEVIN2PROXY_TLS_NAMES` with
-the machine's public IP). Deploy, and you have an HTTPS gateway.
+three values it references (`DEVIN2PROXY_API_KEY`, `DEVIN_TOKEN`,
+`DEVIN2PROXY_DASHBOARD_PASSWORD`). Deploy, and you have a gateway.
 
 ```yaml
 # devin2proxy — Portainer stack for a public VM.
@@ -59,20 +58,13 @@ services:
     restart: unless-stopped
     ports:
       # Published on every interface: the cloud firewall decides who can
-      # actually reach it. The API key and the TLS certificate are the gates.
+      # actually reach it. The API key and the dashboard password are the gates.
       - "8788:8788"
     environment:
       DEVIN2PROXY_ADDR: 0.0.0.0:8788
       DEVIN2PROXY_API_KEY: ${DEVIN2PROXY_API_KEY}
       DEVIN_TOKEN: ${DEVIN_TOKEN}
-      # Self-signed certificate generated into /data on first start and reused
-      # from then on. Its SHA-256 fingerprint is printed at startup — check it
-      # once, then hand clients /data/tls.crt to trust.
-      DEVIN2PROXY_TLS: "1"
-      DEVIN2PROXY_TLS_NAMES: ${DEVIN2PROXY_TLS_NAMES:-}
-      # The dashboard: password-gated, every button behind that gate. With
-      # TLS on, the session cookie is marked Secure and the password never
-      # crosses the wire in cleartext.
+      # The dashboard: password-gated, every button behind that gate.
       DEVIN2PROXY_DASHBOARD: "1"
       DEVIN2PROXY_DASHBOARD_PASSWORD: ${DEVIN2PROXY_DASHBOARD_PASSWORD}
       DEVIN2PROXY_DASHBOARD_ALLOW_REMOTE: "true"
@@ -80,8 +72,7 @@ services:
       # DEVIN2PROXY_TOKENS: ${DEVIN2PROXY_TOKENS:-}
     volumes:
       # /data holds dashboard.json (password hash, session secret, managed
-      # accounts and routes) and tls.crt / tls.key. The volume is what makes
-      # the certificate stable across restarts — TOFU depends on that.
+      # accounts and routes).
       - devin2proxy-data:/data
     # Everything is supplied by env, so the process writes nothing outside
     # /data and the root filesystem can be read-only.
@@ -91,21 +82,13 @@ volumes:
   devin2proxy-data:
 ```
 
-First start prints the certificate fingerprint:
-
-```
-tls: generated a self-signed certificate at /data/tls.crt
-tls: SHA-256 fingerprint AB:CD:…
-listening on https://0.0.0.0:8788
-```
-
 Verify from anywhere:
 
 ```bash
-curl -sk https://<your-ip>:8788/healthz
+curl -s http://<your-ip>:8788/healthz
 # {"credential":"loaded","status":"ok"}
 
-curl -sk https://<your-ip>:8788/v1/chat/completions \
+curl -s http://<your-ip>:8788/v1/chat/completions \
   -H "Authorization: Bearer $DEVIN2PROXY_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model":"swe","messages":[{"role":"user","content":"say pong"}]}'
@@ -136,7 +119,6 @@ docker run -d --name devin2proxy \
   -p 8788:8788 \
   -e DEVIN2PROXY_API_KEY='sk-devin-pick-something-long' \
   -e DEVIN_TOKEN='devin-session-token$…' \
-  -e DEVIN2PROXY_TLS=1 \
   -v devin2proxy-data:/data \
   --read-only \
   ghcr.io/foxy1402/devin2proxy:latest
@@ -167,9 +149,9 @@ config file** — which is what makes `read_only: true` work.
 | `DEVIN2PROXY_PROXIES` | `proxies` | — | outbound routes: `socks5://`, `socks5h://`, `http://`, `https://`, or `direct`; rotates one per request |
 | `DEVIN2PROXY_PROXIES_FILE` | `proxies_file` | — | same, one URL per line |
 | `DEVIN2PROXY_QUOTA_COOLDOWN` | `quota_cooldown` | `1` | a rate-limited account is held until its quota resets instead of retried every 30 s |
-| `DEVIN2PROXY_TLS` | `tls` | off | serve HTTPS; generates a self-signed cert beside the config when none is named |
+| `DEVIN2PROXY_TLS` | `tls` | off | optional native HTTPS: generates a self-signed cert beside the config when none is named (see [Security model](#security-model)) |
 | `DEVIN2PROXY_TLS_CERT_FILE` / `_KEY_FILE` | `tls_cert_file` / `tls_key_file` | `tls.crt` / `tls.key` beside the config | a real certificate, once you have a domain |
-| `DEVIN2PROXY_TLS_NAMES` | `tls_names` | — | extra SANs for the generated cert — **put the machine's public IP here**; `127.0.0.1`, `::1`, `localhost` are always included |
+| `DEVIN2PROXY_TLS_NAMES` | `tls_names` | — | extra SANs for the generated cert — the machine's public IP belongs here |
 | `DEVIN2PROXY_DASHBOARD` | `dashboard` | `1` | serve `/dashboard/` |
 | `DEVIN2PROXY_DASHBOARD_PASSWORD` | `dashboard_password` | generated, printed once | dashboard login |
 | `DEVIN2PROXY_DASHBOARD_ALLOW_REMOTE` | `dashboard_allow_remote` | `false` | allow the dashboard from outside the machine |
@@ -199,17 +181,20 @@ Two independent surfaces, deliberately:
   24-hour cap, persisted across restarts. The password is never stored or
   logged.
 
-For a bare-IP deployment there is no CA that will issue a certificate, so the
-gateway ships its own: `DEVIN2PROXY_TLS=1` generates an ECDSA P-256 self-signed
-pair on first start (825-day validity, the browser ceiling) and prints its
-SHA-256 fingerprint. Because `/data` is a volume, the fingerprint is **stable
-across restarts and redeploys** — trust-on-first-use that actually works.
-Clients trust the `tls.crt` file (curl `-k` for the first contact, then
-`--cacert`; Node `NODE_EXTRA_CA_CERTS`; browsers just need the file imported
-once). The dashboard session cookie is `HttpOnly`, `SameSite=Strict`, scoped to
-`/dashboard`, and gets the `Secure` flag automatically when served over TLS —
-which is why TLS is the recommended remote setup, not a reverse proxy in front
-of plain HTTP.
+The default deployment serves **plain HTTP**. That is a deliberate trade for
+a bare-IP container: a self-signed certificate on a public IP needs every
+client to trust the `tls.crt` file by hand, and cloud load balancers and
+scanners open TCP connections that die mid-handshake and flood the log. The
+API key and the dashboard password therefore cross the wire unencrypted —
+acceptable on your own instance behind a firewall that admits only you, not
+acceptable anywhere else. If you later want encryption, either put a reverse
+proxy with a real certificate in front, or set `DEVIN2PROXY_TLS=1`: the
+gateway generates an ECDSA P-256 self-signed pair on first start (825-day
+validity, the browser ceiling), prints its SHA-256 fingerprint, and reuses it
+from `/data` so the fingerprint is stable across restarts.
+
+The dashboard session cookie is `HttpOnly`, `SameSite=Strict`, scoped to
+`/dashboard`, and gets the `Secure` flag automatically when served over TLS.
 
 Binding to a non-loopback address logs a warning at startup; the cloud
 firewall is what actually decides who reaches the port.
@@ -233,24 +218,21 @@ Any OpenAI-compatible client works by setting the base URL and key.
 
 | setting | value |
 |---------|-------|
-| Base URL | `https://<your-ip>:8788/v1` (or `http://127.0.0.1:8788/v1` locally) |
+| Base URL | `http://<your-ip>:8788/v1` (or `http://127.0.0.1:8788/v1` locally) |
 | API key | your `DEVIN2PROXY_API_KEY` |
 | Model | `swe-1-6-slow` (or the alias `swe`) |
 
-With the self-signed certificate, distribute `tls.crt` to machines that use
-the gateway (import into the OS trust store, or point the client at it —
-Cursor/VS Code: `--cert` / `NODE_EXTRA_CA_CERTS`). Disable any
-embedding/indexing feature: `/v1/embeddings` returns `501` by design.
+Disable any embedding/indexing feature: `/v1/embeddings` returns `501` by
+design. If you deployed with `DEVIN2PROXY_TLS=1`, use `https://` and hand the
+client the `tls.crt` from `/data` (curl `--cacert`, Node
+`NODE_EXTRA_CA_CERTS`, or import it into the OS trust store).
 
 **OpenAI Python SDK**
 
 ```python
-import httpx
 from openai import OpenAI
 
-client = OpenAI(base_url="https://<your-ip>:8788/v1",
-                api_key="sk-devin-…",
-                http_client=httpx.Client(verify="/path/to/tls.crt"))
+client = OpenAI(base_url="http://<your-ip>:8788/v1", api_key="sk-devin-…")
 reply = client.chat.completions.create(
     model="swe", messages=[{"role": "user", "content": "hello"}])
 ```
@@ -259,7 +241,7 @@ reply = client.chat.completions.create(
 
 ```js
 import OpenAI from "openai";
-const client = new OpenAI({ baseURL: "https://<your-ip>:8788/v1", apiKey: "sk-devin-…" });
+const client = new OpenAI({ baseURL: "http://<your-ip>:8788/v1", apiKey: "sk-devin-…" });
 ```
 
 ## Models
@@ -405,10 +387,8 @@ SOCKS5/CONNECT proxy), `quota-probe.mjs` with `zero-quota-fixture.mjs`
 (exercises the quota-hold path against a recorded status response).
 
 The container story is verified the same way: both suites pass end-to-end
-through the published image over HTTPS with the generated certificate
-actually verified by the client, the certificate survives a full container
-destroy-and-recreate with the same fingerprint, and the root filesystem is
-read-only throughout.
+through the published `ghcr.io/foxy1402/devin2proxy:latest` image, with the
+root filesystem read-only throughout.
 
 ## Repository layout
 
@@ -460,7 +440,7 @@ compose.yaml         the Portainer stack above, as a file
 - **`400 invalid_argument`** — a malformed backend request, almost always a
   zero-valued sampling field; the proxy guards against this, so if it comes
   back it is a bug here.
-- **Client reports a certificate name mismatch** — the public IP was not in
-  `DEVIN2PROXY_TLS_NAMES` when the cert was generated. Delete `tls.crt` /
-  `tls.key` from the volume, add the IP, restart; note the fingerprint
-  changes.
+- **`http: TLS handshake error from <ip>` with plain-HTTP clients** — only
+  possible with `DEVIN2PROXY_TLS=1`: something is speaking HTTP to the HTTPS
+  port (a misconfigured client, or a cloud health-check probe). Point the
+  client at `https://`, or serve plain HTTP and let the firewall be the gate.
