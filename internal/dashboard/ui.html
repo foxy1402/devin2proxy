@@ -185,6 +185,7 @@
   async function api(path, opts) {
     opts = opts || {};
     var init = { method: opts.method || "GET", credentials: "same-origin", headers: {} };
+    if (S.token) init.headers["Authorization"] = "Bearer " + S.token;
     if (opts.body !== undefined) {
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(opts.body);
@@ -198,6 +199,10 @@
       var err = new Error(msg);
       err.status = res.status;
       err.data = data;
+      // A 401 means the server no longer recognises us at all — the cookie
+      // was refused and so was the bearer token. Drop the stored token so a
+      // re-login starts clean rather than replaying a dead credential.
+      if (res.status === 401) setToken(null);
       throw err;
     }
     return data;
@@ -235,8 +240,22 @@
     logFilter: { kind: "", level: "", q: "" },
     logTimer: null,
     dropped: 0,
-    overviewTimer: null
+    overviewTimer: null,
+    // The session token the login response handed us, kept beside the cookie
+    // for browsers that will not store an insecure cookie on a remote http
+    // origin (127.0.0.1 is "trustworthy" to browsers; a public IP is not).
+    // sessionStorage so a reload does not lose it.
+    token: null
   };
+  try { S.token = sessionStorage.getItem("d2p_token"); } catch (e) { S.token = null; }
+
+  function setToken(v) {
+    S.token = v || null;
+    try {
+      if (v) sessionStorage.setItem("d2p_token", v);
+      else sessionStorage.removeItem("d2p_token");
+    } catch (e) { /* private mode: memory only */ }
+  }
 
   // ------------------------------------------------------------------- login
 
@@ -266,14 +285,19 @@
 
     var input = el("input", { type: "password", autocomplete: "current-password", placeholder: "dashboard password", autofocus: true });
     var msg = el("div", { class: "small" });
-    var btn = el("button", { class: "primary", text: banned ? "Banned" : "Sign in", disabled: banned });
+    // type="button" on purpose: inside a <form> a typeless button is a submit
+    // button, so Enter in the field fired both the keydown handler and the
+    // form submit — two logins per keystroke, two "signed in" log lines, and a
+    // re-render that looked like the session had been lost.
+    var btn = el("button", { type: "button", class: "primary", text: banned ? "Banned" : "Sign in", disabled: banned });
 
     async function signIn() {
       if (banned) return;
       btn.disabled = true;
       msg.textContent = "";
       try {
-        await api("/login", { method: "POST", body: { password: input.value } });
+        var data = await api("/login", { method: "POST", body: { password: input.value } });
+        if (data && data.token) setToken(data.token);
         input.value = "";
         await boot();
       } catch (err) {
@@ -385,6 +409,7 @@
 
   async function signOut() {
     try { await api("/logout", { method: "POST" }); } catch (e) { /* cookie is cleared either way */ }
+    setToken(null);
     stopStream();
     S.logs = [];
     S.logsPolledOnce = false;

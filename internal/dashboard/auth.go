@@ -286,13 +286,28 @@ func (d *Dashboard) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// authenticated reports whether the request carries a valid session.
+// authenticated reports whether the request carries a valid session, in the
+// cookie or as an Authorization: Bearer header.
+//
+// The header path exists because the cookie alone is not portable: to a
+// browser, http://127.0.0.1 is a "trustworthy" origin and an insecure cookie
+// is accepted without comment, while http://<public-ip> is not — a
+// privacy-configured browser can simply refuse to store the cookie, and the
+// login then loops forever: the server signs the client in, the client never
+// keeps the proof. The login response therefore hands the same value to the
+// page as JSON, and the page sends it as a header on every call afterwards.
+// The cookie is still set (browsers that keep it keep working, and a value
+// held only in JavaScript is one XSS away from being stolen, so both rails
+// run at once deliberately). A bearer header is also immune to CSRF by
+// construction, which the Origin check already covers.
 func (d *Dashboard) authenticated(r *http.Request) bool {
-	c, err := r.Cookie(sessionCookie)
-	if err != nil {
-		return false
+	if c, err := r.Cookie(sessionCookie); err == nil && d.validSession(c.Value, time.Now()) {
+		return true
 	}
-	return d.validSession(c.Value, time.Now())
+	if token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
+		return d.validSession(strings.TrimSpace(token), time.Now())
+	}
+	return false
 }
 
 // clientAddr is the key a ban is filed under: the address, without the port, so

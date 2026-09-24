@@ -401,6 +401,46 @@ func (p *Pool) Remember(creds *Credentials, st *AccountStatus) {
 //     period. One revoked token does not revoke every token.
 //   - Quota evidence can only lengthen a cooldown that a refusal already earned,
 //     and a refusal can never shorten a quota hold. See refreshQuota.
+//
+// refusalDetail extracts what the upstream actually said about a refusal, for
+// the log line. It returns "" when the error carries no words — a transport
+// failure or a cancel — because then there is nothing to quote.
+func refusalDetail(err error) string {
+	if err == nil {
+		return ""
+	}
+	var httpErr *HTTPError
+	var connectErr *ConnectError
+	switch {
+	case errors.As(err, &httpErr):
+		return collapseDetail(string(httpErr.Body))
+	case errors.As(err, &connectErr):
+		return collapseDetail(connectErr.Message)
+	}
+	return ""
+}
+
+// detailSuffix renders a refusal detail for a log line, empty when there is
+// none. The leading space belongs to the format string it fills.
+func detailSuffix(detail string) string {
+	if detail == "" {
+		return ""
+	}
+	return " (" + detail + ")"
+}
+
+// collapseDetail flattens one upstream error into a single bounded log
+// fragment: an HTML error page is dozens of lines, and one of them must not
+// bury the log.
+func collapseDetail(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	const cap = 160
+	if len(s) > cap {
+		s = s[:cap] + "…"
+	}
+	return s
+}
+
 func (p *Pool) Report(creds *Credentials, status int, err error) {
 	if p == nil || creds == nil || creds.poolIndex < 0 {
 		return
@@ -477,16 +517,22 @@ func (p *Pool) Report(creds *Credentials, status int, err error) {
 	available := p.rot.availableLocked(now)
 	p.rot.mu.Unlock()
 
+	// The status code alone cannot be acted on: a 403 from a WAF page and a 403
+	// from the seat-management service are different emergencies, and only the
+	// upstream's own words tell them apart. An earlier deployment logged just
+	// "after HTTP 403" against four healthy accounts, which read as four dead
+	// keys when it was one blocked address.
+	detail := refusalDetail(err)
 	switch {
 	case systemic:
-		log.Printf("account %d/%d (…%s) was refused with HTTP %d and no account is left usable; "+
+		log.Printf("account %d/%d (…%s) was refused with HTTP %d%s and no account is left usable; "+
 			"holding the whole pool out for only %s because a refusal of every account looks like a "+
 			"provider-side change rather than these keys being bad",
-			idx+1, len(p.entries), tail(creds.APIKey), status, CoolRateLimited)
+			idx+1, len(p.entries), tail(creds.APIKey), status, detailSuffix(detail), CoolRateLimited)
 	case !alreadyCooling:
-		log.Printf("account %d/%d (…%s) stepped out of rotation for %s after HTTP %d; "+
+		log.Printf("account %d/%d (…%s) stepped out of rotation for %s after HTTP %d%s; "+
 			"%d/%d accounts still available",
-			idx+1, len(p.entries), tail(creds.APIKey), cool, status, available, len(p.entries))
+			idx+1, len(p.entries), tail(creds.APIKey), cool, status, detailSuffix(detail), available, len(p.entries))
 	}
 
 	// A rate limit is the one refusal that can be told how long it will last, so

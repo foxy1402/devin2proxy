@@ -338,7 +338,11 @@ func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	d.setSessionCookie(w, r, value)
 	d.logf("dashboard: %s signed in", addr)
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true})
+	// The token is handed to the page as well as set as a cookie, because a
+	// browser on a remote plain-HTTP origin may refuse to store the cookie at
+	// all — see authenticated. The page keeps the value and sends it as a
+	// bearer header from then on.
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "token": value})
 }
 
 func (d *Dashboard) handleLogout(w http.ResponseWriter, r *http.Request) {
