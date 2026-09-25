@@ -12,6 +12,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -52,6 +54,11 @@ type Config struct {
 	// authFailureDelay. A test that exercises the 401 path can lower it; nobody
 	// on the internet should be able to raise it away, so New clamps it.
 	AuthFailureDelay time.Duration
+	// CaptureDir, when non-empty, is where every decoded /v1 request body is
+	// written as JSON, one file per request. It exists for DEVIN2PROXY_DEBUG_
+	// CAPTURE: the exact shape a failing client sent, to replay and bisect
+	// offline. Empty (the default) captures nothing.
+	CaptureDir string
 }
 
 // credentials returns the credential for one request: the next account in the
@@ -258,6 +265,9 @@ type Server struct {
 	// configured for, say, "gpt-4" would otherwise log the same line on every
 	// autocomplete request and bury anything that matters.
 	modelFallbacks sync.Map
+	// captureWarn reports a broken capture directory once; request capture is
+	// a debug aid and must not turn into a log flood.
+	captureWarn sync.Once
 }
 
 func New(cfg Config, client *devin.Client) *Server {
@@ -482,6 +492,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeDecodeError(w, err)
 		return
 	}
+	s.captureRequest(req, "chat")
 
 	model, known := s.resolveModel(req.Model)
 	if !known {
@@ -497,7 +508,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	stream, creds, err := s.getChatMessage(ctx, func(c *devin.Credentials) (*devin.GetChatMessageRequest, error) {
-		return openai.BuildDevinRequest(c.APIKey, &req, model, s.opts)
+		built, buildErr := openai.BuildDevinRequest(c.APIKey, &req, model, s.opts)
+		if buildErr == nil {
+			devin.EmitRequestShape(built)
+		}
+		return built, buildErr
 	})
 	if err != nil {
 		// A client that has gone away has nothing to read an error status, and
@@ -841,6 +856,7 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 		writeDecodeError(w, err)
 		return
 	}
+	s.captureRequest(legacy, "completions")
 
 	chat, err := openai.BuildFIMRequest(&legacy)
 	if err != nil {
@@ -858,7 +874,11 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
 	defer cancel()
 	stream, creds, err := s.getChatMessage(ctx, func(c *devin.Credentials) (*devin.GetChatMessageRequest, error) {
-		return openai.BuildDevinRequest(c.APIKey, chat, model, s.opts)
+		built, buildErr := openai.BuildDevinRequest(c.APIKey, chat, model, s.opts)
+		if buildErr == nil {
+			devin.EmitRequestShape(built)
+		}
+		return built, buildErr
 	})
 	if err != nil {
 		if ctx.Err() == nil {
@@ -1042,6 +1062,35 @@ const maxRequestBodyBytes = 8 << 20
 // errBodyTooLarge reports a body over the cap, so the handler can answer 413
 // instead of the confusing JSON parse error a truncated document produces.
 var errBodyTooLarge = errors.New("request body too large")
+
+// captureRequest writes the decoded request body to CaptureDir, one file per
+// request, when DEVIN2PROXY_DEBUG_CAPTURE turned capture on. It is the exact
+// shape the client sent — what translate will consume — so a request the
+// backend refuses can be replayed and bisected offline. Best effort: a
+// capture failure must never fail the request, and an unwritable directory
+// is announced once rather than per request.
+func (s *Server) captureRequest(v any, kind string) {
+	if s.cfg.CaptureDir == "" {
+		return
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	name := fmt.Sprintf("capture-%s-%d.json", kind, time.Now().UnixNano())
+	path := filepath.Join(s.cfg.CaptureDir, name)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		s.captureWarnOnce(path, err)
+		return
+	}
+	log.Printf("captured %s request: %s", kind, name)
+}
+
+func (s *Server) captureWarnOnce(path string, err error) {
+	s.captureWarn.Do(func() {
+		log.Printf("request capture: could not write %s: %v (further capture failures stay quiet)", path, err)
+	})
+}
 
 func decodeJSON(r *http.Request, dst any) error {
 	defer r.Body.Close()

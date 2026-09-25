@@ -164,6 +164,29 @@ func main() {
 	events := eventlog.New(eventlog.DefaultCapacity)
 	log.SetOutput(io.MultiWriter(os.Stderr, events))
 
+	// DEVIN2PROXY_DEBUG_SHAPE=1 prints every backend request's shape — model,
+	// prompt split, tool and image counts, the sampling fields — from the relay
+	// paths and the dashboard's probe alike. It exists to turn "the backend
+	// refused with an internal error" into a diff between the request that was
+	// refused and the probe that served the same account moments earlier.
+	if parseBool(os.Getenv("DEVIN2PROXY_DEBUG_SHAPE")) {
+		devin.RequestShapeLogger = func(req *devin.GetChatMessageRequest) {
+			log.Printf("request shape: %s", req.ShapeLine())
+		}
+		log.Printf("request shape logging: on (DEVIN2PROXY_DEBUG_SHAPE)")
+	}
+
+	// DEVIN2PROXY_DEBUG_CAPTURE=1 writes every decoded /v1 request body into
+	// the config directory, one file per request: the exact shape a failing
+	// client sent, so it can be replayed and bisected offline. Off unless asked
+	// for; the config directory is where the config file already lives, which
+	// in a container is the writable /data volume.
+	captureDir := ""
+	if parseBool(os.Getenv("DEVIN2PROXY_DEBUG_CAPTURE")) {
+		captureDir = filepath.Dir(*configPath)
+		log.Printf("request capture: on, writing to %s", captureDir)
+	}
+
 	store, err := dashboard.OpenStore(dashboardStatePath(*configPath))
 	if err != nil {
 		log.Fatalf("dashboard state: %v", err)
@@ -264,6 +287,7 @@ func main() {
 		Creds:          pool,
 		Events:         events,
 		Dashboard:      panel,
+		CaptureDir:     captureDir,
 	}, client)
 
 	// TLS resolves before anything prints, so a certificate problem is a

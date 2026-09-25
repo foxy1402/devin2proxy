@@ -444,3 +444,17 @@ compose.yaml         the Portainer stack above, as a file
   possible with `DEVIN2PROXY_TLS=1`: something is speaking HTTP to the HTTPS
   port (a misconfigured client, or a cloud health-check probe). Point the
   client at `https://`, or serve plain HTTP and let the firewall be the gate.
+- **Every request `502 credential_rejected` while the dashboard's Test button
+  serves the same accounts fine** — the accounts are healthy; the backend's
+  content screen is refusing the request's *instruction slot* (the system
+  message). The screen is phrase-sensitive, not a keyword list: one coding
+  IDE shipped a security-policy paragraph in its system prompt, and the
+  backend answered `permission_denied: an internal error occurred` for every
+  request it carried — while the identical text passed as a user turn, and
+  paraphrasing one word passed even in the system slot. Reproduce and pin it
+  yourself: `DEVIN2PROXY_DEBUG_SHAPE=1` prints every request's shape (model,
+  prompt split, tool count, sampling fields — the dashboard's Test probe logs
+  its own shape next to them), and `DEVIN2PROXY_DEBUG_CAPTURE=1` writes every
+  `/v1` request body beside the config so a failing client request can be
+  replayed and bisected offline. The fix is on the client side: rephrase or
+  drop the offending system-prompt text.

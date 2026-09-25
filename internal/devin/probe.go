@@ -135,6 +135,10 @@ func (c *Client) ProbeChat(ctx context.Context, creds *Credentials, modelUID str
 		PlannerMode:   PlannerModeDefault,
 		ChatModelUID:  modelUID,
 	}
+	// With the shape hook installed, the probe's request prints next to the
+	// client requests in the same log: the whole point of the probe in this
+	// mode is to be the known-good shape a failing client can be diffed against.
+	EmitRequestShape(req)
 
 	stream, err := c.GetChatMessage(ctx, creds, req)
 	if err != nil {
