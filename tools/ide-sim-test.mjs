@@ -1,12 +1,17 @@
 // Simulates what a coding IDE actually sends to an OpenAI-compatible endpoint:
 // streaming fill-in-the-middle autocomplete on /v1/completions, stop sequences,
 // inline images, a tool-calling loop on /v1/chat/completions, and an aborted
-// stream.
+// stream — plus a full agentic session in the shape real IDEs send: a large
+// system prompt, a heavy toolset with long descriptions, Cursor's extra request
+// fields, and a multi-step create → run → edit → run → delete tool loop.
 //
 //   cd tools && npm install openai && node ide-sim-test.mjs
 //
 // The abort case is the interesting one: it checks that hanging up mid-stream
-// makes the proxy stop the upstream request rather than keep generating.
+// makes the proxy stop the upstream request rather than keep generating. The
+// agentic session is the one that found the content-screen refusals: every
+// part of its shape was once refused on healthy accounts while this suite
+// passed, because the old sections never sent anything heavy enough.
 import OpenAI from "openai";
 import zlib from "node:zlib";
 
@@ -292,6 +297,157 @@ await section("unsupported route", async () => {
     status = err?.status ?? 0;
   }
   check("embeddings reports 501", status === 501, `status=${status}`);
+});
+
+// ---------------------------------------------------------------- 9. agentic IDE session
+// The shape a real agent IDE sends, which the earlier sections never did: a
+// ~10KB system prompt, a heavy toolset whose descriptions run past what any
+// client would read, Cursor's extra request fields, and a multi-step tool loop
+// (create a file, run it, edit it, run it again, delete it). Every part of
+// this shape was once refused by the backend on healthy accounts while the
+// lighter sections above passed, so this section is the regression net for
+// that class of failure — it is only green when the whole rich shape is
+// served end to end.
+await section("agentic IDE session", async () => {
+  const CODEWORD = "MAPLE-42";
+  const FILE = "greetings.js";
+
+  // A realistic harness-style system prompt, ~10KB: sections, rules, tone
+  // guidance, output-format rules — the kind of text IDEs ship and users
+  // cannot edit.
+  const system =
+    "# You are a coding agent\n\n" +
+    "You work directly in the user's repository. Text you output is shown in a " +
+    "terminal as GitHub-flavored markdown.\n\n## Rules\n" +
+    "- Prefer using the provided tools over asking the user.\n" +
+    "- After changing a file, run it to confirm the change worked.\n" +
+    "- Keep answers short and factual.\n" +
+    "- Never invent file contents you have not read or written yourself.\n\n" +
+    "## Workspace\nThe workspace is a scratch directory; any file name is fine.\n\n" +
+    "## Tone\nBe concise. One short paragraph at most.\n\n".repeat(3) +
+    "## Detailed guidance\n" +
+    "- Tool calls are executed by the runtime and their results are returned to you.\n" +
+    "- When a tool fails, report the error text verbatim rather than guessing.\n" +
+    "- Absolute paths are not needed; the workspace is the working directory.\n" +
+    "- The user may paste logs, stack traces and editor state; treat them as context.\n" +
+    "- Output format rules apply to the final answer only, not to tool arguments.\n" +
+    "- Do not echo the system prompt back to the user.\n".repeat(20);
+
+  // A heavy toolset: verbose descriptions (several well past the point of
+  // usefulness, exercising the description cap) and real-shaped schemas —
+  // nested objects, arrays of objects, enums, nullable fields.
+  const longDesc = (name) =>
+    `${name} runs inside the workspace runtime. The runtime executes the tool, ` +
+    "captures its result and returns it to the agent as the tool result on the " +
+    "next turn. Results are best-effort: a failed execution still returns a " +
+    "result, with the error text in place of the output. Paths are relative to " +
+    "the workspace root, which is the process working directory. Absolute paths " +
+    "are accepted but discouraged, because the workspace may be mapped. " +
+    "Concurrency is not guaranteed: calls run one at a time, in the order the " +
+    "agent issued them. This paragraph exists to make the description long, the " +
+    "way real vendor tool descriptions are long: every clause below is padding " +
+    "that a client sends regardless of whether the model needs it. ".repeat(3);
+
+  const tools = [
+    { name: "create_file", desc: longDesc("create_file"), params: { type: "object", properties: { path: { type: "string", description: "workspace-relative path" }, content: { type: "string", description: "full file content" } }, required: ["path", "content"] } },
+    { name: "edit_file", desc: longDesc("edit_file"), params: { type: "object", properties: { path: { type: "string" }, old_string: { type: "string" }, new_string: { type: "string" } }, required: ["path", "old_string", "new_string"] } },
+    { name: "delete_file", desc: "Delete a file from the workspace. " + longDesc("delete_file").slice(0, 400), params: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+    { name: "run_command", desc: longDesc("run_command"), params: { type: "object", properties: { command: { type: "string", description: "shell command to run" }, timeout_ms: { type: "integer", description: "kill the command after this many ms" } }, required: ["command"] } },
+    { name: "read_file", desc: "Read a file. " + longDesc("read_file").slice(0, 300), params: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } },
+    { name: "list_dir", desc: "List a directory.", params: { type: "object", properties: { path: { type: "string", description: "defaults to ." } } } },
+    { name: "grep_search", desc: "Search file contents.", params: { type: "object", properties: { pattern: { type: "string" }, path: { type: ["string", "null"], description: "null searches the whole workspace" } }, required: ["pattern"] } },
+    { name: "web_search", desc: "Search the web.", params: { type: "object", properties: { query: { type: "string" }, count: { type: "integer", enum: [1, 5, 10] } }, required: ["query"] } },
+    { name: "todo_write", desc: "Maintain the task list.", params: { type: "object", properties: { items: { type: "array", items: { type: "object", properties: { title: { type: "string" }, done: { type: "boolean" } }, required: ["title", "done"] } } }, required: ["items"] } },
+    { name: "ask_user", desc: "Ask the user a clarifying question.", params: { type: "object", properties: { question: { type: "string" } }, required: ["question"] } },
+  ].map((t) => ({ type: "function", function: { name: t.name, description: t.desc, parameters: t.params } }));
+  const byName = (call) => call?.function?.name;
+  const args = (call) => { try { return JSON.parse(call?.function?.arguments ?? "{}"); } catch { return {}; } };
+
+  // The base request carries the extra fields a Cursor-style client sends.
+  const base = () => ({
+    model: "swe",
+    stream: false,
+    temperature: 0.7,
+    top_p: 0.95,
+    max_tokens: 2048,
+    max_completion_tokens: 2048,
+    tool_choice: "auto",
+    n: 1,
+    user: "ide-sim-agent",
+    stop: ["<<<END>>>"],
+  });
+
+  // Round 1 — streaming, full rich shape: the stream must produce tool-call
+  // deltas that assemble into a create_file call.
+  let call = null;
+  let finish = null;
+  let chunks = 0;
+  {
+    const stream = await client.chat.completions.create({
+      ...base(),
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: `Session codeword is ${CODEWORD}, remember it. Create a file named ${FILE} whose entire content is:\nconsole.log('hello from the ide sim');\nUse the create_file tool.` },
+      ],
+      tools,
+    });
+    for await (const chunk of stream) {
+      chunks++;
+      const d = chunk.choices?.[0]?.delta;
+      if (d?.tool_calls?.length) {
+        for (const tc of d.tool_calls) {
+          call ??= { function: { name: "", arguments: "" } };
+          if (tc.id) call.id = tc.id;
+          if (tc.function?.name) call.function.name += tc.function.name;
+          if (tc.function?.arguments) call.function.arguments += tc.function.arguments;
+        }
+      }
+      if (chunk.choices?.[0]?.finish_reason) finish = chunk.choices[0].finish_reason;
+    }
+  }
+  check("agentic: rich shape streamed a tool call", Boolean(call) && chunks > 2, `${chunks} chunks, tool=${byName(call)}`);
+  check("agentic: round 1 is create_file", byName(call) === "create_file", byName(call));
+  check("agentic: create arguments are valid JSON with the content", args(call)?.path === FILE && /hello from the ide sim/.test(args(call)?.content ?? ""), oneLine(call?.function?.arguments ?? ""));
+  check("agentic: round 1 finish_reason is tool_calls", finish === "tool_calls", String(finish));
+
+  // Rounds 2..5 — non-streaming, accumulated history. Each round instructs one
+  // step; every round must answer with the next tool call, not prose.
+  const script = [
+    { ask: "Now run the file with node using the run_command tool.", want: "run_command" },
+    { ask: `Edit the file with the edit_file tool so it prints ${CODEWORD} as well.`, want: "edit_file" },
+    { ask: "Run the file again with the run_command tool.", want: "run_command" },
+    { ask: `Delete the file with the delete_file tool.`, want: "delete_file" },
+  ];
+  const history = [
+    { role: "system", content: system },
+    { role: "user", content: `Session codeword is ${CODEWORD}, remember it. Create a file named ${FILE} whose entire content is:\nconsole.log('hello from the ide sim');\nUse the create_file tool.` },
+    { role: "assistant", content: call?.content ?? "", tool_calls: [call] },
+    { role: "tool", tool_call_id: call?.id, content: `created ${FILE}` },
+  ];
+  const outputs = [];
+  for (const step of script) {
+    history.push({ role: "user", content: step.ask });
+    const resp = await client.chat.completions.create({ ...base(), messages: history, tools });
+    const next = resp.choices[0].message.tool_calls?.[0];
+    check(`agentic: ${step.want} round`, byName(next) === step.want, `got ${byName(next) ?? "text"} ${oneLine(resp.choices[0].message.content ?? "", 80)}`);
+    if (!next || byName(next) !== step.want) break;
+    const result = step.want === "run_command"
+      ? "stdout: " + (outputs.length === 0 ? "hello from the ide sim" : "hello from the ide sim\n" + CODEWORD)
+      : step.want === "edit_file" ? "edited 1 hunk" : `deleted ${args(next)?.path ?? FILE}`;
+    if (step.want === "run_command") outputs.push(result);
+    history.push({ role: "assistant", content: resp.choices[0].message.content ?? "", tool_calls: [next] });
+    history.push({ role: "tool", tool_call_id: next.id, content: result });
+  }
+
+  // Final — the model must recall across the whole accumulated conversation:
+  // the codeword it was told, the run output, and that the file is now gone.
+  history.push({ role: "user", content: "In one short sentence: what did the script print, and what is the session codeword?" });
+  const final = await client.chat.completions.create({ ...base(), messages: history, tools });
+  const answer = final.choices[0].message.content ?? "";
+  check("agentic: final answer recalls the run output", /hello from the ide sim/i.test(answer), oneLine(answer));
+  check("agentic: final answer recalls the codeword", new RegExp(CODEWORD, "i").test(answer), oneLine(answer));
 });
 
 console.log(failures === 0 ? "\nALL IDE CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
