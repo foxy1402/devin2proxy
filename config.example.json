@@ -7,6 +7,7 @@
   "max_concurrent": 2,
   "request_timeout_seconds": 600,
   "min_max_tokens": 8192,
+  "max_tool_desc_bytes": 512,
   "tokens": [],
   "tokens_file": "<optional: one devin-session-token$... per line, rotated one account per request>",
   "proxies": [],

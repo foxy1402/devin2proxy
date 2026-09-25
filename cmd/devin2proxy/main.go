@@ -58,6 +58,12 @@ type Config struct {
 	// budget on the model's reasoning before it emits any answer, so a small
 	// request (autocomplete clients ask for 64-256) returns nothing without it.
 	MinMaxTokens int `json:"min_max_tokens"`
+	// MaxToolDescBytes caps each tool description forwarded upstream. The
+	// backend's content screen refuses some request shapes over description
+	// text, and a cap is what makes rich IDE toolsets servable at all; names,
+	// parameters and schemas are never touched. 0 uses the default; a negative
+	// value sends descriptions verbatim.
+	MaxToolDescBytes int `json:"max_tool_desc_bytes"`
 	// Tokens is a list of account credentials to rotate through, one per request,
 	// so several free-tier accounts can share the load. Each entry is a full
 	// `devin-session-token$<jwt>` value, exactly as it appears in the CLI's
@@ -278,16 +284,17 @@ func main() {
 	}
 
 	srv := server.New(server.Config{
-		APIKey:         cfg.APIKey,
-		DefaultModel:   cfg.Model,
-		Models:         cfg.Models,
-		AllowOrigins:   cfg.AllowOrigins,
-		RequestTimeout: time.Duration(cfg.RequestTimeoutS) * time.Second,
-		MinMaxTokens:   cfg.MinMaxTokens,
-		Creds:          pool,
-		Events:         events,
-		Dashboard:      panel,
-		CaptureDir:     captureDir,
+		APIKey:           cfg.APIKey,
+		DefaultModel:     cfg.Model,
+		Models:           cfg.Models,
+		AllowOrigins:     cfg.AllowOrigins,
+		RequestTimeout:   time.Duration(cfg.RequestTimeoutS) * time.Second,
+		MinMaxTokens:     cfg.MinMaxTokens,
+		MaxToolDescBytes: cfg.MaxToolDescBytes,
+		Creds:            pool,
+		Events:           events,
+		Dashboard:        panel,
+		CaptureDir:       captureDir,
 	}, client)
 
 	// TLS resolves before anything prints, so a certificate problem is a
@@ -470,6 +477,9 @@ func loadConfig(path string) (Config, bool, error) {
 		if cfg.MinMaxTokens <= 0 {
 			cfg.MinMaxTokens = openai.DefaultMinMaxTokens
 		}
+		if cfg.MaxToolDescBytes == 0 {
+			cfg.MaxToolDescBytes = openai.DefaultMaxToolDescBytes
+		}
 		if cfg.APIKey == "" && !envSuppliesAPIKey() {
 			key, err := generateKey()
 			if err != nil {
@@ -569,6 +579,13 @@ func applyEnv(cfg *Config) {
 	if v, ok := env("DEVIN2PROXY_MIN_MAX_TOKENS"); ok {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.MinMaxTokens = n
+		}
+	}
+	if v, ok := env("DEVIN2PROXY_MAX_TOOL_DESC_BYTES"); ok {
+		// A negative value is meaningful here (send descriptions verbatim), so
+		// unlike the other numeric knobs it is not clamped.
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.MaxToolDescBytes = n
 		}
 	}
 	if v, ok := env("DEVIN2PROXY_TOKENS"); ok {

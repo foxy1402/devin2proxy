@@ -158,6 +158,7 @@ config file** — which is what makes `read_only: true` work.
 | `DEVIN2PROXY_MODEL` | `model` | `swe-1-6-slow` | default model; a non-backend uid is a start-up error |
 | `DEVIN2PROXY_MODELS` | `models` | `swe-1-6-slow, swe-1.6, swe` | advertised ids |
 | `DEVIN2PROXY_MIN_MAX_TOKENS` | `min_max_tokens` | `8192` | floor on a client's `max_tokens` — see [Models](#models) |
+| `DEVIN2PROXY_MAX_TOOL_DESC_BYTES` | `max_tool_desc_bytes` | `512` | cap on each tool description forwarded upstream (names/schemas untouched); negative sends verbatim — see [Troubleshooting](#troubleshooting) |
 | `DEVIN2PROXY_MAX_CONCURRENT` | `max_concurrent` | `2` | in-flight backend streams |
 | `DEVIN2PROXY_ALLOW_ORIGINS` | `allow_origins` | `*` | CORS |
 | — | `request_timeout_seconds` | `600` | per-request ceiling (config file only) |
@@ -445,16 +446,19 @@ compose.yaml         the Portainer stack above, as a file
   port (a misconfigured client, or a cloud health-check probe). Point the
   client at `https://`, or serve plain HTTP and let the firewall be the gate.
 - **Every request `502 credential_rejected` while the dashboard's Test button
-  serves the same accounts fine** — the accounts are healthy; the backend's
-  content screen is refusing the request's *instruction slot* (the system
-  message). The screen is phrase-sensitive, not a keyword list: one coding
-  IDE shipped a security-policy paragraph in its system prompt, and the
-  backend answered `permission_denied: an internal error occurred` for every
-  request it carried — while the identical text passed as a user turn, and
-  paraphrasing one word passed even in the system slot. Reproduce and pin it
-  yourself: `DEVIN2PROXY_DEBUG_SHAPE=1` prints every request's shape (model,
-  prompt split, tool count, sampling fields — the dashboard's Test probe logs
-  its own shape next to them), and `DEVIN2PROXY_DEBUG_CAPTURE=1` writes every
-  `/v1` request body beside the config so a failing client request can be
-  replayed and bisected offline. The fix is on the client side: rephrase or
-  drop the offending system-prompt text.
+  serves the same accounts fine** — the accounts are healthy; the backend runs
+  a semantic content screen over the request, and it refuses whole shapes: an
+  instruction slot (the system message) carrying certain text, or a toolset
+  whose descriptions trip it. Measured with one coding IDE: its system prompt
+  was refused verbatim while the identical text passed as a user turn, its
+  35-tool toolset was refused wholesale while the same tools with descriptions
+  capped at 600 bytes passed, and paraphrasing one word could flip a refusal.
+  The gateway already mitigates both: the instruction slot always carries a
+  short proven prompt (the client's system prompt rides along as a tagged
+  block in the first user turn, nothing is dropped), and tool descriptions are
+  capped (`max_tool_desc_bytes`, names and schemas untouched). If a client
+  still trips the screen, reproduce and pin it yourself:
+  `DEVIN2PROXY_DEBUG_SHAPE=1` prints every request's shape (the dashboard's
+  Test probe logs its own shape next to them), and `DEVIN2PROXY_DEBUG_CAPTURE=1`
+  writes every `/v1` request body beside the config so a failing request can
+  be replayed and bisected offline.

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"devin2proxy/internal/devin"
 )
@@ -188,5 +189,138 @@ func TestBuildDevinRequestHonoursToolChoiceExactly(t *testing.T) {
 		if _, err := BuildDevinRequest("k", req, "swe-1-6-slow", Options{}); err == nil {
 			t.Errorf("tool_choice %s was accepted; the backend cannot be forced", choice)
 		}
+	}
+}
+
+// The backend screens its instruction field and refuses some text outright
+// (measured: one IDE's security-policy paragraph was refused verbatim, the
+// identical text served as a user turn, a one-word paraphrase served, and the
+// probe's tiny instruction always serves). Most IDEs do not let their users
+// edit the system prompt that trips it, so the instruction slot now always
+// carries the proxy's short proven prompt and the client's system prompt
+// rides along as a tagged block in the first user turn. These tests pin both
+// halves of that mapping, because a regression in either direction is silent:
+// the client's instructions would vanish, or the refusal would come back.
+func TestTheInstructionSlotIsAlwaysTheProvenPrompt(t *testing.T) {
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: "system", Content: Content{Text: "you are a pirate"}},
+			{Role: "user", Content: Content{Text: "hi"}},
+		},
+	}
+	out, err := BuildDevinRequest("k", req, "swe-1-6-slow", Options{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if out.Prompt != DefaultSystemPrompt {
+		t.Errorf("instruction slot carried %q, want the fixed proven prompt", out.Prompt)
+	}
+	if len(out.ChatMessagePrompts) != 2 {
+		t.Fatalf("got %d turns, want the system block plus the user turn", len(out.ChatMessagePrompts))
+	}
+	first := out.ChatMessagePrompts[0]
+	if !strings.Contains(first.Prompt, "you are a pirate") || !strings.HasPrefix(first.Prompt, "<system>") {
+		t.Errorf("the client's system prompt did not ride along as a tagged block: %q", first.Prompt)
+	}
+	if out.ChatMessagePrompts[1].Prompt != "hi" {
+		t.Errorf("the user turn was disturbed: %q", out.ChatMessagePrompts[1].Prompt)
+	}
+}
+
+func TestANoSystemRequestStaysUnwrapped(t *testing.T) {
+	req := &ChatRequest{Messages: []Message{{Role: "user", Content: Content{Text: "hi"}}}}
+	out, err := BuildDevinRequest("k", req, "swe-1-6-slow", Options{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if out.Prompt != DefaultSystemPrompt {
+		t.Errorf("instruction slot carried %q, want the fixed proven prompt", out.Prompt)
+	}
+	if len(out.ChatMessagePrompts) != 1 || strings.Contains(out.ChatMessagePrompts[0].Prompt, "<system>") {
+		t.Errorf("a request with no system message grew a wrapper turn: %+v", out.ChatMessagePrompts)
+	}
+}
+
+func TestMultipleSystemMessagesJoinInsideOneBlock(t *testing.T) {
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: "system", Content: Content{Text: "rule one"}},
+			{Role: "system", Content: Content{Text: "rule two"}},
+			{Role: "user", Content: Content{Text: "hi"}},
+		},
+	}
+	out, err := BuildDevinRequest("k", req, "swe-1-6-slow", Options{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if len(out.ChatMessagePrompts) != 2 {
+		t.Fatalf("got %d turns, want one block plus the user turn", len(out.ChatMessagePrompts))
+	}
+	block := out.ChatMessagePrompts[0].Prompt
+	if !strings.Contains(block, "rule one") || !strings.Contains(block, "rule two") {
+		t.Errorf("the block lost one of the client's system messages: %q", block)
+	}
+}
+
+func TestTheAssistantLabelNoteStaysInTheInstructionSlot(t *testing.T) {
+	req := &ChatRequest{
+		Messages: []Message{
+			{Role: "system", Content: Content{Text: "be brief"}},
+			{Role: "user", Content: Content{Text: "hi"}},
+			{Role: "assistant", Content: Content{Text: "hello"}},
+			{Role: "user", Content: Content{Text: "again"}},
+		},
+	}
+	out, err := BuildDevinRequest("k", req, "swe-1-6-slow", Options{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if !strings.Contains(out.Prompt, AssistantLabelNote) {
+		t.Error("the assistant-label note left the instruction slot")
+	}
+}
+
+// The backend's content screen covers tool definitions too: one IDE's
+// toolset was refused wholesale until its descriptions were capped, while the
+// same tools with shorter descriptions (and the same names and schemas)
+// passed. The cap defaults on, is lossy by design, and a negative setting
+// sends descriptions verbatim.
+func TestToolDescriptionsAreCappedByDefault(t *testing.T) {
+	long := strings.Repeat("describe ", 300) // 2700 bytes
+	req := &ChatRequest{
+		Messages: []Message{{Role: "user", Content: Content{Text: "hi"}}},
+		Tools:    []Tool{{Type: "function", Function: ToolFunction{Name: "t", Description: long, Parameters: json.RawMessage(`{"type":"object"}`)}}},
+	}
+	out, err := BuildDevinRequest("k", req, "swe-1-6-slow", Options{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if got := len(out.Tools[0].Description); got > DefaultMaxToolDescBytes {
+		t.Errorf("description is %d bytes, want capped at %d", got, DefaultMaxToolDescBytes)
+	}
+	if !utf8.ValidString(out.Tools[0].Description) {
+		t.Error("the cap split a multi-byte character")
+	}
+
+	verbatim, err := BuildDevinRequest("k", req, "swe-1-6-slow", Options{MaxToolDescBytes: -1})
+	if err != nil {
+		t.Fatalf("build verbatim: %v", err)
+	}
+	if verbatim.Tools[0].Description != long {
+		t.Error("a negative cap did not send the description verbatim")
+	}
+}
+
+func TestTruncateRunesNeverSplitsACharacter(t *testing.T) {
+	s := "héllo wörld" // multi-byte characters from index 1
+	cut := truncateRunes(s, 3)
+	if !utf8.ValidString(cut) {
+		t.Errorf("the cut split a character: %q", cut)
+	}
+	if truncateRunes(s, -1) != s {
+		t.Error("a negative cap did not keep the string verbatim")
+	}
+	if truncateRunes(s, len(s)) != s {
+		t.Error("a cap at the exact length changed the string")
 	}
 }

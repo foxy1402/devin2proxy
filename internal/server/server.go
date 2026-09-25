@@ -40,6 +40,10 @@ type Config struct {
 	// MinMaxTokens is the floor applied to a client's max_tokens. See
 	// openai.DefaultMinMaxTokens for why it exists.
 	MinMaxTokens int
+	// MaxToolDescBytes caps each tool description forwarded upstream. See
+	// openai.DefaultMaxToolDescBytes for why a cap exists at all. Negative
+	// sends descriptions verbatim.
+	MaxToolDescBytes int
 	// Creds, when set, rotates several accounts, one per request. Leave it nil to
 	// use the CLI's own stored credential.
 	Creds *devin.Pool
@@ -287,7 +291,7 @@ func New(cfg Config, client *devin.Client) *Server {
 		cfg:    cfg,
 		client: client,
 		mux:    http.NewServeMux(),
-		opts:   openai.Options{MinMaxTokens: cfg.MinMaxTokens},
+		opts:   openai.Options{MinMaxTokens: cfg.MinMaxTokens, MaxToolDescBytes: cfg.MaxToolDescBytes},
 	}
 	s.mux.HandleFunc("/v1/chat/completions", s.auth(s.handleChatCompletions))
 	s.mux.HandleFunc("/v1/completions", s.auth(s.handleCompletions))
