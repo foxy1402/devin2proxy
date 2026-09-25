@@ -120,6 +120,40 @@ func TestFetchModelCatalogueRefusesAnEmptyAnswer(t *testing.T) {
 	}
 }
 
+// A response cut inside the last entry: that entry's length prefix still
+// promises bytes the response does not carry. The reader's error used to be
+// invisible, and the entries before the cut came back looking like the whole
+// catalogue.
+func TestACorruptCatalogueIsAnErrorNotAHalfCatalogue(t *testing.T) {
+	cut := encodeTestCatalogue()[:len(encodeTestCatalogue())-5]
+
+	models, err := decodeModelCatalogue(cut)
+	if err == nil {
+		t.Fatal("a corrupt catalogue decoded without an error")
+	}
+	if len(models) != 0 {
+		t.Errorf("a corrupt catalogue still returned %d entries", len(models))
+	}
+	// The exported entry point keeps its signature for the tools; it must not
+	// present the half that parsed as a complete answer either.
+	if models := DecodeModelCatalogue(cut); len(models) != 0 {
+		t.Errorf("DecodeModelCatalogue returned %d entries for a corrupt body", len(models))
+	}
+}
+
+func TestFetchModelCatalogueRefusesACorruptBody(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/proto")
+		w.Write(encodeTestCatalogue()[:40]) // a cut inside an entry: a length that cannot be satisfied
+	}))
+	defer stub.Close()
+
+	creds := &Credentials{APIKey: "devin-session-token$x", APIServerURL: stub.URL}
+	if _, err := NewClient(Options{}).FetchModelCatalogue(context.Background(), creds); err == nil {
+		t.Fatal("a corrupt catalogue body was accepted")
+	}
+}
+
 // metadataIDEName reads field 1 (the Metadata message) → field 1 (ide_name) out of a
 // metadata request body.
 func metadataIDEName(t *testing.T, body []byte) string {

@@ -1,12 +1,15 @@
 package devin
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 
@@ -288,6 +291,74 @@ func TestTheExchangeRefusesWithoutACodeOrVerifier(t *testing.T) {
 	}
 	if _, err := ExchangeDevinCLIPKCECode(context.Background(), "http://127.0.0.1:1", "c", ""); err == nil {
 		t.Error("a missing verifier was accepted")
+	}
+}
+
+// TestTheExchangeNeverFollowsARedirect pins the rule that keeps the one-time code
+// and its verifier one-party: the exchange request must not be replayed to a
+// redirect target. A 307 or 308 would otherwise carry the body — code, verifier
+// and all — to wherever the Location header points, and a successful sign-in at
+// that target would be indistinguishable from a real one.
+func TestTheExchangeNeverFollowsARedirect(t *testing.T) {
+	var followed int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/elsewhere" {
+			followed++
+			_, _ = w.Write(encodeToken(testJWT))
+			return
+		}
+		if r.URL.Path != ExchangePath {
+			t.Errorf("request went to %s, want %s", r.URL.Path, ExchangePath)
+		}
+		w.Header().Set("Location", "/elsewhere")
+		w.WriteHeader(http.StatusTemporaryRedirect) // 307: replay the body, per the RFC
+	}))
+	t.Cleanup(srv.Close)
+
+	token, err := ExchangeDevinCLIPKCECode(context.Background(), srv.URL, "the-code", "the-verifier")
+	if err == nil {
+		t.Fatalf("a redirect was followed to a token (%q); the exchange must never follow one", token)
+	}
+	if followed != 0 {
+		t.Errorf("the redirect target received %d request(s); the code and verifier would have been replayed", followed)
+	}
+	// The 3xx itself surfaces through the same path any other refusal takes.
+	if !strings.Contains(err.Error(), "307") {
+		t.Errorf("error = %v, want it to carry the redirect status", err)
+	}
+}
+
+// TestAnHTTPSignInURLWarnsButStillWorks pins the logging, not a refusal: a plain
+// http sign-in host is allowed (a test deployment has no TLS to offer), but the
+// code_challenge in the URL and the code rendered back are secrets, so the use
+// has to be visible in the log.
+func TestAnHTTPSignInURLWarnsButStillWorks(t *testing.T) {
+	var sink bytes.Buffer
+	log.SetOutput(&sink)
+	defer log.SetOutput(os.Stderr)
+
+	got, err := SignInURL("http://localhost:8080", "st4te", "ch4llenge")
+	if err != nil {
+		t.Fatalf("SignInURL refused an http host: %v", err)
+	}
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if u.Host != "localhost:8080" || u.Scheme != "http" {
+		t.Errorf("sign-in URL = %s, want an http URL on localhost:8080", got)
+	}
+	if !strings.Contains(sink.String(), "plain http") {
+		t.Errorf("no plaintext warning was logged:\n%s", sink.String())
+	}
+
+	// And the https path must not warn.
+	sink.Reset()
+	if _, err := SignInURL(DefaultWebappHost, "st4te", "ch4llenge"); err != nil {
+		t.Fatalf("SignInURL: %v", err)
+	}
+	if strings.Contains(sink.String(), "plain http") {
+		t.Errorf("an https sign-in was warned about:\n%s", sink.String())
 	}
 }
 

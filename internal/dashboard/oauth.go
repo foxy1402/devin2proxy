@@ -90,14 +90,6 @@ func (l *loginFlows) take(state string, now time.Time) (pendingLogin, bool) {
 	return flow, ok
 }
 
-// len reports how many sign-ins are in progress, for the overview and for tests.
-func (l *loginFlows) len(now time.Time) int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.pruneLocked(now)
-	return len(l.flows)
-}
-
 func (l *loginFlows) pruneLocked(now time.Time) {
 	for state, flow := range l.flows {
 		if now.Sub(flow.started) > loginFlowTTL {

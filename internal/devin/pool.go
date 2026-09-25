@@ -76,20 +76,29 @@ const MaxQuotaCool = 12 * time.Hour
 // NewPool builds a pool from raw token strings. Tokens are the full
 // `devin-session-token$<jwt>` values as they appear in credentials.toml; blank
 // entries and `#` comments are ignored so a hand-maintained file can be read
-// directly.
+// directly, and a repeated line is kept once so a file edited by hand cannot
+// grow two slots that always cool together.
 //
 // apiServerURL overrides the backend for every entry, matching the env override
-// behaviour of LoadCredentials.
+// behaviour of LoadCredentials, including the trailing-slash trim.
 func NewPool(tokens []string, apiServerURL string) *Pool {
+	// A trailing slash on the override would otherwise reach the backend doubled
+	// on every pooled request; LoadCredentials trims the same way.
+	apiServerURL = strings.TrimRight(apiServerURL, "/")
 	if apiServerURL == "" {
 		apiServerURL = defaultAPIServerURL
 	}
 	p := &Pool{}
+	seen := make(map[string]bool, len(tokens))
 	for _, raw := range tokens {
 		tok := cleanToken(raw)
 		if tok == "" {
 			continue
 		}
+		if seen[tok] {
+			continue
+		}
+		seen[tok] = true
 		p.entries = append(p.entries, &Credentials{
 			APIKey:       tok,
 			APIServerURL: apiServerURL,
@@ -183,6 +192,11 @@ func (p *Pool) Add(raw string) int {
 	})
 	p.rot.appendSlot()
 
+	// Every per-slot slice grows inside this one critical section — entries and
+	// the cursor under rot.mu, the quota slices under quotaMu nested inside it —
+	// so applyQuota and ClearCooldown can index the quota slices by a slot the
+	// rotation lock resolved and never meet a short slice. Growing them apart
+	// would break that len invariant between the two locks.
 	p.quotaMu.Lock()
 	p.busy = append(p.busy, false)
 	p.quotaCoolUntil = append(p.quotaCoolUntil, time.Time{})
@@ -199,6 +213,36 @@ func (p *Pool) Remove(idx int) bool {
 	}
 	p.rot.mu.Lock()
 	defer p.rot.mu.Unlock()
+	return p.removeLocked(idx)
+}
+
+// RemoveCredential drops the given credential from the pool and reports whether
+// it was found. It takes the credential rather than an index for the same reason
+// ClearCooldown and Report do: a caller holding an index read from an earlier
+// States snapshot cannot trust it, because a concurrent Remove renumbers the
+// survivors. Resolving the slot and splicing it out happen under one holding of
+// the rotation lock, so this can never act on the wrong account.
+//
+// It exists so the dashboard can remove by identity — the credential it got from
+// a request in flight, say — without first re-reading an index it would then
+// have to defend.
+func (p *Pool) RemoveCredential(creds *Credentials) bool {
+	if p == nil {
+		return false
+	}
+	p.rot.mu.Lock()
+	defer p.rot.mu.Unlock()
+	idx := p.indexLocked(creds)
+	if idx < 0 {
+		return false
+	}
+	return p.removeLocked(idx)
+}
+
+// removeLocked splices slot idx out and renumbers the survivors, in entries, the
+// cursor and the per-slot quota slices alike. Call it with rot.mu held, quotaMu
+// nested where the quota state is touched.
+func (p *Pool) removeLocked(idx int) bool {
 	if idx < 0 || idx >= len(p.entries) {
 		return false
 	}
@@ -364,13 +408,18 @@ func (p *Pool) indexLocked(creds *Credentials) int {
 // Remember files what a status call said about one account, so a list can show an
 // email instead of a token tail. It is display data: nothing in the pool's
 // cooldown decisions reads it.
+//
+// Both locks are held, rot.mu nested with quotaMu inside it: the status this
+// answers was fetched over a window in which the list may have been renumbered,
+// and resolving the slot and writing the identity must not straddle that window
+// or the entry lands on whichever account now occupies the index.
 func (p *Pool) Remember(creds *Credentials, st *AccountStatus) {
 	if p == nil || st == nil {
 		return
 	}
 	p.rot.mu.Lock()
+	defer p.rot.mu.Unlock()
 	idx := p.indexLocked(creds)
-	p.rot.mu.Unlock()
 	if idx < 0 {
 		return
 	}
@@ -442,7 +491,7 @@ func collapseDetail(s string) string {
 }
 
 func (p *Pool) Report(creds *Credentials, status int, err error) {
-	if p == nil || creds == nil || creds.poolIndex < 0 {
+	if p == nil || creds == nil {
 		return
 	}
 	if err != nil {
@@ -476,10 +525,13 @@ func (p *Pool) Report(creds *Credentials, status int, err error) {
 	}
 
 	p.rot.mu.Lock()
+	// poolIndex is read under the rotation lock, not before it: Remove
+	// renumbers the survivors under the same lock, so reading it outside would
+	// race the renumbering. Verify identity rather than trusting the index — a
+	// credential that did not come from this pool carries a zero or negative
+	// index, which would otherwise look like a real slot and knock a healthy
+	// account out of rotation.
 	idx := creds.poolIndex
-	// Verify identity rather than trusting the index: a credential that did not
-	// come from this pool carries a zero index, which would otherwise look like
-	// slot 0 and knock a healthy account out of rotation.
 	if idx < 0 || idx >= len(p.entries) || p.entries[idx] != creds {
 		p.rot.mu.Unlock()
 		return
@@ -653,19 +705,27 @@ func (p *Pool) refreshQuota(creds *Credentials) {
 	if p == nil {
 		return
 	}
+	// Resolve the slot and mark it busy under one holding of the rotation lock,
+	// with quotaMu nested inside it (the established order; see ClearCooldown).
+	// Releasing rot.mu between resolving idx and indexing busy would let a
+	// concurrent Remove splice and renumber the per-slot slices, leaving this
+	// goroutine — which runs unrecovered before its caller's request returns —
+	// indexing out of range, or flipping the wrong account's busy flag and
+	// never clearing it.
+	var fn StatusFunc
 	p.rot.mu.Lock()
 	idx := p.indexLocked(creds)
-	p.rot.mu.Unlock()
-	if idx < 0 {
-		return
-	}
-	p.quotaMu.Lock()
-	fn := p.status
-	busy := fn == nil || p.busy[idx] || p.quotaHeldLocked(idx, time.Now())
+	busy := idx < 0
 	if !busy {
-		p.busy[idx] = true
+		p.quotaMu.Lock()
+		fn = p.status
+		busy = fn == nil || p.busy[idx] || p.quotaHeldLocked(idx, time.Now())
+		if !busy {
+			p.busy[idx] = true
+		}
+		p.quotaMu.Unlock()
 	}
-	p.quotaMu.Unlock()
+	p.rot.mu.Unlock()
 	if busy {
 		return
 	}

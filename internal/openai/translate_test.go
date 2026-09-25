@@ -1,7 +1,11 @@
 package openai
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"log"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -322,5 +326,220 @@ func TestTruncateRunesNeverSplitsACharacter(t *testing.T) {
 	}
 	if truncateRunes(s, len(s)) != s {
 		t.Error("a cap at the exact length changed the string")
+	}
+}
+
+// A multi-byte rune straddling the filter's hold-back cut used to be split
+// between two emitted fragments. The SSE path marshals each fragment
+// separately, and JSON cannot represent a partial rune, so the client's
+// reassembled text carried U+FFFD where the character should be. The cut is now
+// rune-aligned; this test pins that by round-tripping every emitted fragment
+// through JSON exactly the way the SSE writer does.
+func TestStopFilterKeepsMultiByteRunesWhole(t *testing.T) {
+	const stop = "STOP"
+	body := "Answer: 你好世界 — an emoji: 😀 — plus 中文 text before the end."
+	input := body + stop + " discarded after the stop"
+
+	filter := NewStopFilter([]string{stop})
+	var reassembled strings.Builder
+	for len(input) > 0 && !filter.Truncated() {
+		n := 3 // lands inside the CJK and emoji runes on purpose
+		if n > len(input) {
+			n = len(input)
+		}
+		frag := filter.Write(input[:n])
+		input = input[n:]
+		if !utf8.ValidString(frag) {
+			t.Fatalf("emitted fragment %q is not valid UTF-8; the client would see U+FFFD", frag)
+		}
+		b, err := json.Marshal(frag)
+		if err != nil {
+			t.Fatalf("marshal fragment: %v", err)
+		}
+		var back string
+		if err := json.Unmarshal(b, &back); err != nil {
+			t.Fatalf("unmarshal fragment: %v", err)
+		}
+		reassembled.WriteString(back)
+	}
+	if got := reassembled.String(); got != body {
+		t.Fatalf("reassembled = %q, want the input up to the stop, byte-identical: %q", got, body)
+	}
+	if !filter.Truncated() {
+		t.Error("the stop sequence was never detected")
+	}
+	if tail := filter.Flush(); tail != "" {
+		t.Errorf("Flush after a hit returned %q, want nothing", tail)
+	}
+}
+
+func TestParseStopRefusesAMalformedStop(t *testing.T) {
+	// A malformed stop used to disable the filter silently, which answers a
+	// different request than the one made; now it is an error the server can
+	// surface as a 400.
+	for _, raw := range []string{`5`, `["a", 5]`, `true`, `{"a":1}`} {
+		if _, err := ParseStop(json.RawMessage(raw)); err == nil {
+			t.Errorf("ParseStop(%s) was accepted; the filter would be silently disabled", raw)
+		}
+	}
+	// The shapes OpenAI documents keep working.
+	if stops, err := ParseStop(json.RawMessage(`"END"`)); err != nil || len(stops) != 1 || stops[0] != "END" {
+		t.Errorf("ParseStop(string) = %v, %v", stops, err)
+	}
+	if stops, err := ParseStop(json.RawMessage(`["a","b"]`)); err != nil || len(stops) != 2 {
+		t.Errorf("ParseStop(array) = %v, %v", stops, err)
+	}
+	if stops, err := ParseStop(nil); err != nil || stops != nil {
+		t.Errorf("ParseStop(absent) = %v, %v", stops, err)
+	}
+}
+
+func TestAnUnknownContentPartTypeIsRefused(t *testing.T) {
+	// Dropping an unknown part silently can erase a whole user turn; OpenAI's
+	// own API refuses the request, and so does this one, naming the type.
+	var c Content
+	err := json.Unmarshal([]byte(`[{"type":"text","text":"hi"},{"type":"audio","audio":{"data":"x"}}]`), &c)
+	if err == nil {
+		t.Fatalf("an unknown content part type was accepted: %+v", c)
+	}
+	if !strings.Contains(err.Error(), `"audio"`) {
+		t.Errorf("error = %q, want it to name the part type", err)
+	}
+}
+
+func TestMaxCompletionTokensWinsWhenBothAreSet(t *testing.T) {
+	// Both values sit above the floor, so which one survived is observable.
+	modern, legacy := 9000, 9500
+	req := &ChatRequest{
+		Messages:            []Message{{Role: "user", Content: Content{Text: "hi"}}},
+		MaxTokens:           &legacy,
+		MaxCompletionTokens: &modern,
+	}
+	out, err := BuildDevinRequest("k", req, "swe-1-6-slow", Options{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if out.Configuration.MaxTokens != 9000 {
+		t.Fatalf("MaxTokens = %d, want the modern max_completion_tokens value 9000", out.Configuration.MaxTokens)
+	}
+}
+
+func TestAcceptedButUnenforcedParametersAreReported(t *testing.T) {
+	old := log.Writer()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(old) })
+
+	frequency, presence, seed := 0.5, 1.0, 42
+	req := &ChatRequest{
+		Messages:         []Message{{Role: "user", Content: Content{Text: "hi"}}},
+		ResponseFormat:   json.RawMessage(`{"type":"json_object"}`),
+		FrequencyPenalty: &frequency,
+		PresencePenalty:  &presence,
+		Seed:             &seed,
+	}
+	// The request must be served — working clients send these on every call —
+	// but what was not enforced has to show up in the log.
+	if _, err := BuildDevinRequest("k", req, "swe-1-6-slow", Options{}); err != nil {
+		t.Fatalf("response_format was refused: %v", err)
+	}
+	line := buf.String()
+	for _, want := range []string{"response_format json_object", "frequency_penalty", "presence_penalty", "seed"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("log line %q does not mention %q", line, want)
+		}
+	}
+	if n := strings.Count(strings.TrimSpace(line), "\n") + 1; n != 1 {
+		t.Errorf("the note spans %d lines, want one line total", n)
+	}
+
+	// The harmless forms stay quiet.
+	buf.Reset()
+	quiet := &ChatRequest{
+		Messages:       []Message{{Role: "user", Content: Content{Text: "hi"}}},
+		ResponseFormat: json.RawMessage(`{"type":"text"}`),
+	}
+	if _, err := BuildDevinRequest("k", quiet, "swe-1-6-slow", Options{}); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("a request with nothing unenforced logged %q", buf.String())
+	}
+}
+
+func TestAnEmptyToolResultIsSentAsAPlaceholder(t *testing.T) {
+	// An empty prompt field is dropped on the wire, so the model would see the
+	// tool call it made and no answer to it; the user branch guards the same
+	// way with a placeholder.
+	var req ChatRequest
+	if err := json.Unmarshal([]byte(`{"messages":[
+		{"role":"user","content":"weather?"},
+		{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},
+		{"role":"tool","tool_call_id":"call_1","content":""}
+	]}`), &req); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	out, err := BuildDevinRequest("k", &req, "swe-1-6-slow", Options{})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	for _, p := range out.ChatMessagePrompts {
+		if p.ToolCallID != "call_1" {
+			continue
+		}
+		if p.Prompt != "(empty tool result)" {
+			t.Fatalf("the empty tool result was sent as %q, want the placeholder", p.Prompt)
+		}
+		return
+	}
+	t.Fatal("the tool turn never reached the wire")
+}
+
+func TestImageSizeToleratesTheURLSafeAlphabet(t *testing.T) {
+	// A hand-built PNG header (signature, IHDR length, "IHDR", dimensions).
+	// The wide first dimension puts '/' in the base64 — which the URL-safe
+	// alphabet writes as '_' — so both spellings are exercised, and the whole
+	// payload fits in the prefix the sniffer decodes.
+	hdr := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R'}
+	hdr = binary.BigEndian.AppendUint32(hdr, 0x00FFFFFF)
+	hdr = binary.BigEndian.AppendUint32(hdr, 1)
+	std := base64.StdEncoding.EncodeToString(hdr)
+	urlSafe := strings.NewReplacer("+", "-", "/", "_").Replace(std)
+	if urlSafe == std {
+		t.Fatal("the test image did not exercise the URL-safe alphabet")
+	}
+	if w, h := imageSize(urlSafe); w != 0x00FFFFFF || h != 1 {
+		t.Errorf("URL-safe alphabet rejected: %dx%d, want 16777215x1", w, h)
+	}
+	if w, h := imageSize(std); w != 0x00FFFFFF || h != 1 {
+		t.Errorf("standard alphabet regressed: %dx%d", w, h)
+	}
+}
+
+func TestContentMarshalJSONKeepsImagesReplayable(t *testing.T) {
+	// A multimodal request captured as a bare string would lose the images and
+	// could not be replayed; the marshaled shape must decode back to the same
+	// content.
+	const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+	var c Content
+	if err := json.Unmarshal([]byte(`[{"type":"text","text":"describe"},
+		{"type":"image_url","image_url":{"url":"`+png+`"}}]`), &c); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	b, err := json.Marshal(c)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var back Content
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("the marshaled content does not decode back (%s): %v", b, err)
+	}
+	if back.Text != "describe" || len(back.Images) != 1 ||
+		back.Images[0].MediaType != "image/png" || back.Images[0].Width != 1 || back.Images[0].Height != 1 {
+		t.Fatalf("round trip lost content: %+v (%s)", back, b)
+	}
+	// Plain text still marshals as the bare string.
+	if s, err := json.Marshal(Content{Text: "hi"}); err != nil || string(s) != `"hi"` {
+		t.Errorf("Marshal(Content{Text}) = %s, %v; want the bare string", s, err)
 	}
 }

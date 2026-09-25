@@ -3,6 +3,7 @@ package devin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sort"
 	"time"
@@ -91,7 +92,10 @@ func (c *Client) FetchModelCatalogue(ctx context.Context, creds *Credentials) ([
 	if err != nil {
 		return nil, err
 	}
-	models := DecodeModelCatalogue(body)
+	models, err := decodeModelCatalogue(body)
+	if err != nil {
+		return nil, err
+	}
 	if len(models) == 0 {
 		return nil, errors.New("devin: the model catalogue came back empty")
 	}
@@ -110,14 +114,26 @@ func FindModel(models []ModelConfig, uid string) (ModelConfig, bool) {
 }
 
 // DecodeModelCatalogue reads the catalogue out of a GetCliModelConfigs response.
-// Its top level is one repeated field 1, one model per entry.
+// Its top level is one repeated field 1, one model per entry. It is the
+// best-effort entry point the diagnostic tools use; the fetch path goes through
+// decodeModelCatalogue, which reports a corrupt body instead of quietly
+// returning whatever happened to parse.
 func DecodeModelCatalogue(b []byte) []ModelConfig {
+	models, _ := decodeModelCatalogue(b)
+	return models
+}
+
+// decodeModelCatalogue is DecodeModelCatalogue with the reader's error surfaced.
+// A corrupt catalogue — a length that runs past the end of the buffer, say — used
+// to decode to the entries before the corruption with no signal, presenting half
+// a catalogue as the whole thing.
+func decodeModelCatalogue(b []byte) ([]ModelConfig, error) {
 	var out []ModelConfig
 	r := pb.NewReader(b)
 	for {
 		field, wire, ok := r.Field()
 		if !ok {
-			return out
+			break
 		}
 		if field == 1 && wire == pb.WireBytes {
 			if m, ok := decodeModelConfig(r.Bytes()); ok {
@@ -127,6 +143,10 @@ func DecodeModelCatalogue(b []byte) []ModelConfig {
 		}
 		r.Skip(wire)
 	}
+	if r.Err() != nil {
+		return nil, fmt.Errorf("devin: corrupt model catalogue: %w", r.Err())
+	}
+	return out, nil
 }
 
 // decodeModelConfig reads one model. An entry with no uid is not a model and is

@@ -128,6 +128,14 @@ func SignInURL(webappHost, state, challenge string) (string, error) {
 	if u.Scheme != "https" && u.Scheme != "http" {
 		return "", fmt.Errorf("devin: sign-in host %q must be an http or https URL", webappHost)
 	}
+	// An http:// sign-in is allowed — a test deployment, usually — but not
+	// silently: the code_challenge travels in this URL and the rendered code
+	// travels back, and both are secrets the flow depends on. Say so in the log
+	// and still return the URL; refusing it would break the deployments that
+	// have no TLS to offer.
+	if u.Scheme == "http" {
+		log.Printf("devin: sign-in host %q uses plain http: the PKCE code challenge and the rendered sign-in code will travel unencrypted", webappHost)
+	}
 	u.Path = strings.TrimSuffix(u.Path, "/") + "/auth/cli/continue"
 	q := u.Query()
 	q.Set("state", state)
@@ -159,6 +167,18 @@ func randomURLSafe(n int) (string, error) {
 		return "", fmt.Errorf("devin: random: %w", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// exchangeClient never follows a redirect. The exchange request carries a
+// one-time code and the verifier that matches it; replaying that body to
+// wherever a 307 or 308 points would hand both to a party the sign-in never
+// chose. ErrUseLastResponse makes the client return the redirect response
+// itself instead, which then fails through the same non-200 path any other
+// refusal takes.
+var exchangeClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
 }
 
 // ExchangeDevinCLIPKCECode trades a sign-in code for a session token.
@@ -195,7 +215,7 @@ func ExchangeDevinCLIPKCECode(ctx context.Context, apiServerURL, code, verifier 
 	req.Header.Set("Accept", "application/proto, application/json")
 	req.ContentLength = int64(len(w.Bytes()))
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := exchangeClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("devin: exchange request: %w", err)
 	}

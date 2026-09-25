@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -337,6 +338,70 @@ func waitHits(t *testing.T, hits *int32, want int32) {
 
 // ---- spec parsing -------------------------------------------------------
 
+func TestStripEgressCredentials(t *testing.T) {
+	// The mask is what reaches the dashboard and the log, so any form that
+	// leaves real credentials behind is a leak, and any form that mangles the
+	// route is a support ticket. The tricky cases are an `@` later in the URL —
+	// in a path or a query — which must not hide the userinfo's one.
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain userinfo", "http://user:secret@host:3128", "http://" + CredentialMask + "@host:3128"},
+		{"no userinfo", "http://host:3128", "http://host:3128"},
+		{"no userinfo, path", "socks5://host:1080/edge", "socks5://host:1080/edge"},
+		{"userinfo plus a query-@ trick", "http://user:secret@host:3128/?x=1@2",
+			"http://" + CredentialMask + "@host:3128/?x=1@2"},
+		{"userinfo plus a path-@ trick", "socks5://user:secret@host:1080/a@b",
+			"socks5://" + CredentialMask + "@host:1080/a@b"},
+		{"@ in the path only is not userinfo", "http://host:3128/a@b", "http://host:3128/a@b"},
+		{"@ in the query only is not userinfo", "http://host:3128/?token=x@y", "http://host:3128/?token=x@y"},
+		{"credentials in the query are not userinfo", "http://host:3128/?u=user:p@ss", "http://host:3128/?u=user:p@ss"},
+		{"an @ inside a password", "http://user:se@cret@host:3128", "http://" + CredentialMask + "@host:3128"},
+		{"userinfo with a fragment", "http://user:secret@host:3128#f@g", "http://" + CredentialMask + "@host:3128#f@g"},
+		{"no scheme is left alone", "host:3128", "host:3128"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := stripEgressCredentials(tc.in)
+			if got != tc.want {
+				t.Errorf("stripEgressCredentials(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			// Whatever goes in, real credentials must not come out of the
+			// authority segment: this is the property, independent of the
+			// expected strings above.
+			authority := ""
+			if i := strings.Index(tc.in, "://"); i >= 0 {
+				authority = tc.in[i+3:]
+				if end := strings.IndexAny(authority, "/?#"); end >= 0 {
+					authority = authority[:end]
+				}
+			}
+			if strings.Contains(authority, "secret") && strings.Contains(got, "secret") {
+				t.Errorf("stripEgressCredentials(%q) = %q, which leaks the authority's credentials", tc.in, got)
+			}
+		})
+	}
+}
+
+func TestHostOnly(t *testing.T) {
+	// The host part feeds tls.Config.ServerName, so a mangled IPv6 literal would
+	// break the handshake rather than just look odd.
+	cases := map[string]string{
+		"host.example:443":  "host.example",
+		"127.0.0.1:8080":    "127.0.0.1",
+		"[::1]:443":         "::1",
+		"[2001:db8::1]:443": "2001:db8::1",
+		"no-port":           "no-port",
+	}
+	for in, want := range cases {
+		if got := hostOnly(in); got != want {
+			t.Errorf("hostOnly(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestNewEgressPoolParsesSpecs(t *testing.T) {
 	pool, err := NewEgressPool([]string{
 		"socks5://127.0.0.1:1080",
@@ -436,6 +501,135 @@ func TestEgressPoolRotatesOnePerRequest(t *testing.T) {
 }
 
 // ---- cooldown rules ----------------------------------------------------
+
+// startSilentListener accepts connections and then says nothing, which is what a
+// black-holed proxy looks like to our dialers: the TCP connect succeeds and every
+// handshake read runs into the dial deadline.
+func startSilentListener(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { conn.Close() }) // held, never answered
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestBrokenCtxSplitsCallerCancellationFromRouteTimeouts pins the rule the
+// dialers classify by: only a caller who gave up (ctx.Err() != nil) escapes the
+// cooldown. A dialer's own DialTimeout against a dead route delivers
+// os.ErrDeadlineExceeded, which isContextFailure reads as caller cancellation —
+// the misreading that used to leave dead routes in rotation forever.
+func TestBrokenCtxSplitsCallerCancellationFromRouteTimeouts(t *testing.T) {
+	e := &Egress{label: "socks5://127.0.0.1:1080"}
+	dialTimedOut := fmt.Errorf("dial tcp 127.0.0.1:1080: i/o timeout: %w", os.ErrDeadlineExceeded)
+
+	t.Run("a dialer timeout with a live caller is broken", func(t *testing.T) {
+		ctx := context.Background()
+		var egErr *EgressError
+		err := brokenCtx(ctx, e, "dial proxy", dialTimedOut)
+		if !errors.As(err, &egErr) || !egErr.Broken {
+			t.Fatalf("brokenCtx with a live ctx = %#v, want Broken", err)
+		}
+	})
+	t.Run("a caller who gave up is not broken", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var egErr *EgressError
+		err := brokenCtx(ctx, e, "dial proxy", dialTimedOut)
+		if !errors.As(err, &egErr) || egErr.Broken {
+			t.Fatalf("brokenCtx with a cancelled ctx = %#v, want not Broken", err)
+		}
+	})
+}
+
+// TestDialTimeoutsMarkTheRouteBroken is the regression test for dead routes
+// that never cooled down: every timeout below is raised by the dialer's own
+// deadline — the shape a black-holed exit produces — so each must arrive as a
+// Broken EgressError, and reporting it must take the route out of rotation.
+func TestDialTimeoutsMarkTheRouteBroken(t *testing.T) {
+	const timeout = 150 * time.Millisecond
+	cases := []struct {
+		name   string
+		scheme string
+		dial   func(e *Egress, ctx context.Context, addr string) error
+	}{
+		{"socks5 handshake", "socks5", func(e *Egress, ctx context.Context, addr string) error {
+			_, err := dialSOCKS5(e, ctx, addr, "", "", "server.codeium.com:443", timeout)
+			return err
+		}},
+		{"http CONNECT reply", "http", func(e *Egress, ctx context.Context, addr string) error {
+			_, err := dialHTTPConnect(e, ctx, "http", addr, "", "", "server.codeium.com:443", timeout)
+			return err
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := startSilentListener(t)
+			pool, err := NewEgressPool([]string{tc.scheme + "://" + addr}, EgressOptions{DialTimeout: timeout})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Dial and report against the pool's own route, the way a real
+			// request would: the error carries the route it was raised on.
+			route := pool.Next()
+			err = tc.dial(route, context.Background(), addr)
+
+			var egErr *EgressError
+			if !errors.As(err, &egErr) {
+				t.Fatalf("dial error = %#v, want an EgressError", err)
+			}
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("setup: dial error %v is not the dialer-deadline shape this test is about", err)
+			}
+			if !egErr.Broken {
+				t.Fatalf("a dial-deadline timeout on a silent proxy arrived as Broken=false (%v); "+
+					"the route would never cool down", err)
+			}
+			// And the pool must act on it: one report takes the route out.
+			pool.Report(route, egErr)
+			if got := pool.Available(); got != 0 {
+				t.Fatalf("Available = %d after reporting the broken dial, want 0", got)
+			}
+		})
+	}
+}
+
+// TestACancelledDialDoesNotMarkTheRouteBroken is the other half of the rule: a
+// caller whose context has already fired must not cost the route its place, even
+// though the dial error itself reads like a timeout.
+func TestACancelledDialDoesNotMarkTheRouteBroken(t *testing.T) {
+	addr := startSilentListener(t)
+	pool, err := NewEgressPool([]string{"socks5://" + addr}, EgressOptions{DialTimeout: 150 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := pool.Next()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = dialSOCKS5(route, ctx, addr, "", "", "server.codeium.com:443", 150*time.Millisecond)
+	if err == nil {
+		t.Fatal("a dial on a cancelled context returned no error")
+	}
+	var egErr *EgressError
+	if errors.As(err, &egErr) && egErr.Broken {
+		t.Fatalf("a cancelled dial arrived as Broken=true (%v)", err)
+	}
+	pool.Report(route, err)
+	if got := pool.Available(); got != 1 {
+		t.Fatalf("Available = %d after reporting a cancelled dial, want 1", got)
+	}
+}
 
 func TestEgressReportCoolsOnlyOnBrokenRoute(t *testing.T) {
 	// This is the rule that keeps a working proxy in rotation: anything that came
@@ -793,11 +987,12 @@ func callOnce(t *testing.T, client *Client, baseURL string) (string, error) {
 	return resp.DeltaText, nil
 }
 
-// ProbeEgress dials the route itself, outside http.Transport. A direct route has no
-// dialer of its own — its transport is left on Go's default, which is reached
-// through a nil DialContext — so calling that field directly is a nil dereference.
-// It panicked a live dashboard request, which is why it has a test of its own
-// despite looking like the least risky thing on the page.
+// ProbeEgress dials the route itself, outside http.Transport. Every route now
+// carries a DialContext — the direct one a timed plain dialer — but the nil
+// fallback in dialEgress is kept honest here anyway: calling the field directly
+// on a transport without one is a nil dereference, and it panicked a live
+// dashboard request, which is why it has a test of its own despite looking like
+// the least risky thing on the page.
 func TestProbeEgressOnADirectRouteDoesNotPanic(t *testing.T) {
 	// Nothing listening: the probe must report the dial failure.
 	dead := freePort(t)

@@ -33,10 +33,18 @@ func TestShapeLineReportsTheCountsThatDecideServing(t *testing.T) {
 		ChatModelUID: "swe-1-6-slow",
 	}
 	line := req.ShapeLine()
-	want := "model=swe-1-6-slow rtype=5 planner=1 prompts=3(user=2 system=0 tool=1) tools=3 images=1 turn_bytes=21 system_bytes=18" +
+	want := "model=swe-1-6-slow rtype=5 planner=1 traj=absent cascade=absent prompts=3(user=2 system=0 tool=1) tools=3 images=1 turn_bytes=21 system_bytes=18" +
 		" max_tokens=8192 temp=1 top_p=0.95 top_k=40 max_newlines=400"
 	if line != want {
 		t.Errorf("ShapeLine:\n got %q\nwant %q", line, want)
+	}
+
+	// The trajectory/cascade pair is on the line because a request carrying
+	// neither is a hard rejection: which of the two a request presented has to
+	// be visible when diffing a refused request against a served one.
+	routed := &GetChatMessageRequest{TrajectoryRef: NewTrajectoryReference(), CascadeID: "cascade-1"}
+	if line := routed.ShapeLine(); !strings.Contains(line, "traj=present cascade=present") {
+		t.Errorf("a routed request printed %q, want traj=present cascade=present", line)
 	}
 
 	// A request built without a Configuration block says so instead of

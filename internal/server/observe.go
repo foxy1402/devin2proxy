@@ -42,7 +42,6 @@ type reqTrace struct {
 	account   string
 	route     string
 	errMsg    string
-	code      string
 	tokensIn  int
 	tokensOut int
 }
@@ -105,7 +104,6 @@ func (t *reqTrace) snapshot() eventlog.Event {
 		Account:   t.account,
 		Route:     t.route,
 		Error:     t.errMsg,
-		Code:      t.code,
 		TokensIn:  t.tokensIn,
 		TokensOut: t.tokensOut,
 	}
@@ -231,9 +229,9 @@ func (s *Server) emitRequest(r *http.Request, rec *recordingWriter, tr *reqTrace
 	if rec.errMsg != "" {
 		e.Error = rec.errMsg
 	}
-	if e.Code == "" {
-		e.Code = rec.code
-	}
+	// The code only ever comes from the recorded body: the trace carries no code
+	// of its own, so there is nothing to prefer over the client-facing one.
+	e.Code = rec.code
 
 	e.Level = eventlog.LevelInfo
 	switch {
@@ -242,11 +240,9 @@ func (s *Server) emitRequest(r *http.Request, rec *recordingWriter, tr *reqTrace
 	case e.Status >= 400 || e.Error != "":
 		e.Level = eventlog.LevelWarn
 	}
-	// A client that goes away is routine — an IDE cancels autocomplete on every
-	// keystroke — so it is recorded, but never as an error.
-	if e.Status == 499 {
-		e.Level = eventlog.LevelInfo
-	}
+	// A disconnect needs no special case here: the relay paths return quietly
+	// when the client goes away, so the event carries the 200 (or no status at
+	// all) and lands on info on its own.
 	s.cfg.Events.Emit(e)
 }
 

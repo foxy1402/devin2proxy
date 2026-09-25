@@ -80,7 +80,12 @@ func (d *Dashboard) handleProxiesSave(w http.ResponseWriter, r *http.Request) {
 		d.deny(w, r, http.StatusBadRequest, "the route list was not installed: "+err.Error())
 		return
 	}
-	d.cfg.Client.SetEgress(pool)
+	// Release the replaced pool's idle connections rather than letting them
+	// linger until the idle timeout; in-flight requests on the old pool are
+	// unaffected because their connections are not idle.
+	if old := d.cfg.Client.SetEgress(pool); old != nil {
+		old.Close()
+	}
 
 	if d.cfg.Store != nil {
 		// Stored cleaned rather than as pasted: this is the list the pool was built
@@ -159,11 +164,17 @@ func (d *Dashboard) handleProxyTest(w http.ResponseWriter, r *http.Request) {
 
 // proxySpecs is the list the textarea shows: what the dashboard manages if it
 // manages anything, otherwise what the process was configured with.
+//
+// The fallback to the running pool's own list applies only when the store has no
+// proxies key at all — a pool built from config or the environment before the
+// dashboard ever managed routes. Once the store manages the list, its answer wins
+// even when it is empty, because an empty stored list is an operator's deliberate
+// "no routes". Feeding pool.Specs() in over it would hand the page
+// credential-stripped lines and a later save would write the mask back as if it
+// were real credentials.
 func (d *Dashboard) proxySpecs() []string {
-	if d.cfg.ProxiesExternal == "" && d.cfg.Store != nil {
-		if stored := d.cfg.Store.Proxies(); len(stored) > 0 {
-			return stored
-		}
+	if d.cfg.ProxiesExternal == "" && d.cfg.Store != nil && d.cfg.Store.HasProxies() {
+		return d.cfg.Store.Proxies()
 	}
 	if pool := d.cfg.Client.Egress(); pool.Len() > 0 {
 		return pool.Specs()
@@ -236,6 +247,12 @@ func maskSpecs(specs []string) []string {
 // position does not match is a scan over the whole list used, which is the
 // ambiguous case the position check exists to avoid.
 //
+// A stored line that is itself the masked form is never used as the restoration
+// source: it carries no credentials, so "restoring" it would write the mask into
+// the pool as if the mask were the password. That can only happen when the list
+// the page was shown came from the running pool rather than the store, and the
+// honest outcome for such a line is to leave it as it arrived.
+//
 // A masked line that matches nothing stored is left as it is: the pool will then
 // reject it, which is the honest outcome for a route nobody can authenticate.
 func restoreCredentials(specs, stored []string) []string {
@@ -249,11 +266,11 @@ func restoreCredentials(specs, stored []string) []string {
 			continue
 		}
 		restored := spec
-		if i < len(stored) && devin.MaskSpec(stored[i]) == spec {
+		if i < len(stored) && devin.MaskSpec(stored[i]) == spec && !devin.HasMaskedCredentials(stored[i]) {
 			restored = stored[i]
 		} else {
 			for _, known := range stored {
-				if devin.MaskSpec(known) == spec {
+				if devin.MaskSpec(known) == spec && !devin.HasMaskedCredentials(known) {
 					restored = known
 					break
 				}

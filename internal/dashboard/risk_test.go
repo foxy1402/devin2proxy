@@ -171,6 +171,25 @@ func TestRestoreCredentialsLeavesAnEmptyListAlone(t *testing.T) {
 	}
 }
 
+// A stored line that is itself the mask — what pool.Specs() hands back, or a line
+// a past bug wrote into the store — carries no credentials, so it must never be
+// used as a restoration source. Restoring against it would write "***:***" into
+// the pool as if the mask were the password.
+func TestAMaskedStoredLineIsNeverARestorationSource(t *testing.T) {
+	stored := []string{
+		"socks5://***:***@proxy.example:1080",             // a credential-stripped copy
+		"socks5://alice:real-password@proxy.example:1080", // the real route
+	}
+	in := []string{devin.MaskSpec(stored[1])}
+	if in[0] != stored[0] {
+		t.Fatalf("the stripped copy does not mask alike: %q vs %q", in[0], stored[0])
+	}
+	restored := restoreCredentials(in, stored)
+	if restored[0] != stored[1] {
+		t.Fatalf("restore = %q, want the line that actually carries credentials", restored[0])
+	}
+}
+
 // The page surfaces a refused test — including the throttle's 429 — by showing
 // the server's own error text, so the operator sees why the button did nothing
 // rather than concluding the account is broken.

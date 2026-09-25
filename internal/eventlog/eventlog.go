@@ -1,9 +1,11 @@
 // Package eventlog carries the proxy's runtime events to whoever is watching:
-// a bounded in-memory history for a page that has just loaded, live subscribers
-// for one that is already open, and an io.Writer so the standard logger feeds it
-// without every log call having to change.
+// a bounded in-memory history that a page which has just loaded — or one that
+// polls every few seconds — reads with Recent, and an io.Writer so the standard
+// logger feeds it without every log call having to change.
 //
-// It deliberately knows nothing about the proxy. Everything in it is fed by the
+// There is deliberately no live-subscriber path: the dashboard's log view is
+// served by /logs/recent polling, which costs one short request per open page
+// instead of a held connection per open page. Everything here is fed by the
 // caller, which is what keeps the dashboard out of the request path: an event is
 // a value, not a callback into the UI.
 package eventlog
@@ -16,7 +18,7 @@ import (
 
 // Event is one thing that happened. The request fields are empty for a log line
 // and the log fields are empty for a request, so one type covers both without a
-// second stream to subscribe to.
+// second history to keep.
 type Event struct {
 	Seq  int64     `json:"seq"`
 	Time time.Time `json:"time"`
@@ -61,22 +63,14 @@ const (
 // that the memory is uninteresting.
 const DefaultCapacity = 1000
 
-// subscriberBuffer is how many events may be queued for one live subscriber. A
-// subscriber that cannot keep up loses events rather than stalling the proxy:
-// nothing here may ever block a request, so the send is non-blocking and the
-// loss is counted and reported.
-const subscriberBuffer = 256
-
-// Hub fans events out to the history and to every live subscriber.
+// Hub keeps the bounded history of events. Its only reader is Recent, which is
+// what the dashboard's log view polls.
 type Hub struct {
 	mu       sync.Mutex
 	ring     []Event
 	start    int // index of the oldest event, once the ring has wrapped
 	count    int
 	seq      int64
-	subs     map[int]chan Event
-	nextSub  int
-	dropped  uint64
 	capacity int
 }
 
@@ -88,20 +82,20 @@ func New(capacity int) *Hub {
 	}
 	return &Hub{
 		ring:     make([]Event, capacity),
-		subs:     map[int]chan Event{},
 		capacity: capacity,
 	}
 }
 
-// Emit records an event and hands it to every live subscriber. It never blocks:
-// a subscriber whose buffer is full loses the event, and the count of losses is
-// reported by Dropped so the UI can say so instead of quietly showing a gap.
+// Emit records an event in the history. It takes the hub's lock for the moment
+// it needs to append and never waits on anything else, so a logger or a request
+// handler on the hot path is never held up by the dashboard's reading habits.
 func (h *Hub) Emit(e Event) {
 	if h == nil {
 		return
 	}
 	now := time.Now()
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.seq++
 	e.Seq = h.seq
 	if e.Time.IsZero() {
@@ -123,14 +117,6 @@ func (h *Hub) Emit(e Event) {
 		h.ring[h.start] = e
 		h.start = (h.start + 1) % h.capacity
 	}
-	for _, ch := range h.subs {
-		select {
-		case ch <- e:
-		default:
-			h.dropped++
-		}
-	}
-	h.mu.Unlock()
 }
 
 // Recent returns the retained history, oldest first.
@@ -145,42 +131,6 @@ func (h *Hub) Recent() []Event {
 		out = append(out, h.ring[(h.start+i)%h.capacity])
 	}
 	return out
-}
-
-// Dropped reports how many events a subscriber was too slow to receive.
-func (h *Hub) Dropped() uint64 {
-	if h == nil {
-		return 0
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.dropped
-}
-
-// Subscribe returns a channel of events and a function that stops the
-// subscription. Both are safe to call more than once on the cancel function, so
-// a handler can defer it without tracking whether it already fired.
-func (h *Hub) Subscribe() (<-chan Event, func()) {
-	if h == nil {
-		return nil, func() {}
-	}
-	ch := make(chan Event, subscriberBuffer)
-	h.mu.Lock()
-	id := h.nextSub
-	h.nextSub++
-	h.subs[id] = ch
-	h.mu.Unlock()
-
-	var once sync.Once
-	cancel := func() {
-		once.Do(func() {
-			h.mu.Lock()
-			delete(h.subs, id)
-			h.mu.Unlock()
-			close(ch)
-		})
-	}
-	return ch, cancel
 }
 
 // Write makes the hub usable as a log output: every line the standard logger

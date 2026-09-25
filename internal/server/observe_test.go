@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"devin2proxy/internal/devin"
 	"devin2proxy/internal/eventlog"
@@ -225,5 +227,120 @@ func TestMaskedRouteSpecsAreRecognisable(t *testing.T) {
 	// A route with no credentials is left exactly as it is.
 	if got := devin.MaskSpec("http://127.0.0.1:8080"); got != "http://127.0.0.1:8080" {
 		t.Errorf("MaskSpec of a credential-free route = %q", got)
+	}
+}
+
+func TestAClientDisconnectOnTheNonStreamingRelaysIsQuiet(t *testing.T) {
+	for _, tc := range []struct{ path, body string }{
+		{"/v1/chat/completions", `{"model":"swe-1.6","messages":[{"role":"user","content":"hi"}]}`},
+		{"/v1/completions", `{"model":"swe-1.6","prompt":"hi"}`},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			// The backend sends one frame — enough for the proxy's connect phase
+			// to succeed — and then hangs, so the client's hang-up lands inside
+			// the relay loop the way an IDE's cancel does.
+			release := make(chan struct{})
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Write(textFrame("half an answer", 0, false))
+				<-release
+			}))
+			t.Cleanup(func() { close(release); backend.Close() })
+
+			hub := eventlog.New(64)
+			srv := New(Config{
+				APIKey: "sk-devin-test",
+				Models: []string{"swe-1.6"},
+				Creds:  devin.NewPool([]string{"devin-session-token$stub"}, backend.URL),
+				Events: hub,
+			}, devin.NewClient(devin.Options{MaxConcurrent: 1}))
+			api := httptest.NewServer(srv)
+			t.Cleanup(api.Close)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, api.URL+tc.path, strings.NewReader(tc.body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer sk-devin-test")
+			req.Header.Set("Content-Type", "application/json")
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = http.DefaultClient.Do(req)
+			}()
+			// Give the relay time to get past the connect phase — the stub
+			// answers its first frame immediately — then hang up.
+			time.Sleep(250 * time.Millisecond)
+			cancel()
+			<-done
+
+			// The event is emitted when the handler returns; wait for it.
+			var e eventlog.Event
+			for deadline := time.Now().Add(5 * time.Second); ; {
+				if evs := hub.Recent(); len(evs) == 1 {
+					e = evs[0]
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the request was never recorded")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			// A hang-up is routine and has no reader for a 502: it must not be
+			// recorded as an upstream failure carrying an error body's code.
+			if e.Level == eventlog.LevelError {
+				t.Errorf("a disconnect was recorded at error level: %+v", e)
+			}
+			if e.Code != "" {
+				t.Errorf("a disconnect was recorded with code %q; no error body was written", e.Code)
+			}
+		})
+	}
+}
+
+func TestMethodNotAllowedNamesTheAllowedMethod(t *testing.T) {
+	srv, _ := observingServer(t)
+	for _, tc := range []struct{ method, path, wantAllow string }{
+		{http.MethodGet, "/v1/chat/completions", http.MethodPost},
+		{http.MethodPut, "/v1/completions", http.MethodPost},
+		{http.MethodPost, "/v1/models", "GET, HEAD"},
+		{http.MethodPost, "/healthz", "GET, HEAD"},
+	} {
+		rec := do(srv, tc.method, tc.path, "sk-devin-test", "")
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s %s = %d, want 405", tc.method, tc.path, rec.Code)
+			continue
+		}
+		if allow := rec.Header().Get("Allow"); allow != tc.wantAllow {
+			t.Errorf("%s %s Allow = %q, want %q", tc.method, tc.path, allow, tc.wantAllow)
+		}
+	}
+	// The read-only routes answer GET and HEAD as before.
+	if rec := do(srv, http.MethodGet, "/v1/models", "sk-devin-test", ""); rec.Code != http.StatusOK {
+		t.Errorf("GET /v1/models = %d, want 200", rec.Code)
+	}
+	if rec := do(srv, http.MethodHead, "/healthz", "", ""); rec.Code != http.StatusOK {
+		t.Errorf("HEAD /healthz = %d, want 200", rec.Code)
+	}
+}
+
+func TestAMalformedStopIsA400BeforeAnythingUpstream(t *testing.T) {
+	// observingServer's stub backend refuses everything with a 503, so a 400
+	// here also proves the request never spent an account's attempt: the stop
+	// is validated before the upstream call, like the rest of the request
+	// validation.
+	srv, hub := observingServer(t)
+	rec := do(srv, http.MethodPost, "/v1/chat/completions", "sk-devin-test",
+		`{"model":"swe-1.6","stop":5,"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400 (body %s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_request_error") {
+		t.Errorf("body = %s, want the invalid_request_error type", rec.Body)
+	}
+	if events := hub.Recent(); len(events) != 1 || events[0].Status != http.StatusBadRequest {
+		t.Errorf("recorded %+v, want one 400 event", events)
 	}
 }

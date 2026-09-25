@@ -67,7 +67,7 @@ func serveCertificate(certPath, keyPath string, names []string, mayGenerate bool
 		return tls.Certificate{}, false, fmt.Errorf("found %s but not %s; a certificate needs both halves", present, missing)
 	default:
 		if !mayGenerate {
-			return tls.Certificate{}, false, fmt.Errorf("no certificate at %s; set tls_auto to generate a self-signed one, or point tls_cert_file and tls_key_file at an existing pair", certPath)
+			return tls.Certificate{}, false, fmt.Errorf("no certificate at %s; enable tls (or DEVIN2PROXY_TLS=1) to have one generated, or point tls_cert_file and tls_key_file at an existing pair", certPath)
 		}
 		if err := generateSelfSigned(certPath, keyPath, names); err != nil {
 			return tls.Certificate{}, false, err
@@ -218,5 +218,42 @@ func warnCertExpiry(cert tls.Certificate, certPath string) {
 	case leaf.NotAfter.Sub(now) < 30*24*time.Hour:
 		log.Printf("tls: the certificate at %s expires on %s (within 30 days); replace it before then",
 			certPath, leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+}
+
+// warnUncoveredNames flags a name the operator asked for that the loaded
+// certificate does not actually cover. The pair is reused TOFU-style, so
+// tls_names added after the first generation would otherwise be silently
+// ignored: the operator gets the startup success and then a name-mismatch
+// error on every client, with nothing pointing at the stale certificate as
+// the cause. Deleting the pair (or pointing tls_cert_file elsewhere) is the
+// fix, and the warning is the hint.
+func warnUncoveredNames(cert tls.Certificate, names []string, certPath string) {
+	if len(names) == 0 || len(cert.Certificate) == 0 {
+		return
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return
+	}
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		covered := false
+		if ip := net.ParseIP(n); ip != nil {
+			for _, candidate := range leaf.IPAddresses {
+				if candidate.Equal(ip) {
+					covered = true
+					break
+				}
+			}
+		} else {
+			covered = leaf.VerifyHostname(n) == nil
+		}
+		if !covered {
+			log.Printf("tls: WARNING the certificate at %s does not cover the requested name %q; delete the pair to regenerate with the current tls_names", certPath, n)
+		}
 	}
 }

@@ -10,14 +10,12 @@ import (
 	"strings"
 )
 
-// Credentials mirrors the four fields of the CLI's credentials.toml.
+// Credentials mirrors the fields of the CLI's credentials.toml this proxy uses.
 type Credentials struct {
 	// APIKey is the bearer value, e.g. "devin-session-token$<jwt>".
 	APIKey string
 	// APIServerURL is the inference backend, normally https://server.codeium.com.
 	APIServerURL string
-	DevinWebHost string
-	DevinAPIURL  string
 	// Source names where the credential was read from, for logging only.
 	Source string
 	// poolIndex is the slot this credential occupies in a Pool, or -1 when it did
@@ -112,9 +110,10 @@ func credentialsPath() (string, error) {
 	return filepath.Join(home, ".local", "share", "devin", "credentials.toml"), nil
 }
 
-// parseCredentialsFile reads the small TOML file the CLI writes. Only the four
-// known top-level string keys are interpreted, so this stays a few lines rather
-// than pulling in a TOML parser.
+// parseCredentialsFile reads the small TOML file the CLI writes. Only the known
+// top-level string keys this proxy uses are interpreted — everything else,
+// including keys it once read but no longer needs, is skipped — so this stays a
+// few lines rather than pulling in a TOML parser.
 func parseCredentialsFile(path string) (*Credentials, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -138,10 +137,6 @@ func parseCredentialsFile(path string) (*Credentials, error) {
 			out.APIKey = value
 		case "api_server_url":
 			out.APIServerURL = strings.TrimRight(value, "/")
-		case "devin_webapp_host":
-			out.DevinWebHost = value
-		case "devin_api_url":
-			out.DevinAPIURL = value
 		}
 	}
 	return out, nil

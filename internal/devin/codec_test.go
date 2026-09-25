@@ -1,6 +1,7 @@
 package devin
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -65,6 +66,92 @@ func TestATruncatedResponseFrameIsFlagged(t *testing.T) {
 	}
 	if resp.DeltaText != "" {
 		t.Fatalf("the half that parsed was kept as a complete delta: %q", resp.DeltaText)
+	}
+}
+
+func TestATruncatedRequestFrameIsFlagged(t *testing.T) {
+	w := pb.NewWriter()
+	w.RawBytes(reqChatMessagePrompts, encodeChatMessagePrompt(ChatMessagePrompt{Source: SourceUser, Prompt: "turn one"}))
+	w.RawBytes(reqChatMessagePrompts, encodeChatMessagePrompt(ChatMessagePrompt{Source: SourceUser, Prompt: "turn two that gets cut off"}))
+	full := w.Bytes()
+
+	if req := DecodeGetChatMessageRequest(full); req.truncated {
+		t.Fatal("a complete message was flagged as truncated")
+	} else if len(req.ChatMessagePrompts) != 2 {
+		t.Fatalf("complete message decoded to %d prompts", len(req.ChatMessagePrompts))
+	}
+
+	// Cut the payload inside the second prompt: the length prefix still
+	// promises bytes that do not exist. Appending the empty prompt the failed
+	// read returns would invent a turn the client never sent.
+	cut := full[:len(full)-10]
+	req := DecodeGetChatMessageRequest(cut)
+	if !req.truncated {
+		t.Fatal("a message that ran out mid-field was not flagged as truncated")
+	}
+	if len(req.ChatMessagePrompts) != 1 {
+		t.Fatalf("the cut frame kept %d prompts, want only the one that parsed", len(req.ChatMessagePrompts))
+	}
+	// The description has to say so too: a half frame must not pass for a
+	// whole one when a capture is being inspected.
+	if desc := DescribeRequest(req); !strings.Contains(desc, "truncated") {
+		t.Errorf("DescribeRequest hid the truncation:\n%s", desc)
+	}
+}
+
+func TestAnUnknownFieldInsideATrajectoryReferenceIsDescribed(t *testing.T) {
+	w := pb.NewWriter()
+	w.Message(reqTrajectoryRef, func(ref *pb.Writer) {
+		ref.String(trTrajectoryID, "8f0c9cba-6fde-4d1f-a4e9-1f2b3c4d5e6f")
+		ref.Varint(9, 77) // a field number we have no name for
+	})
+	req := DecodeGetChatMessageRequest(w.Bytes())
+	if req.TrajectoryRef == nil || len(req.TrajectoryRef.Unknown) != 1 {
+		t.Fatalf("the unknown field inside the reference was not recorded: %+v", req.TrajectoryRef)
+	}
+	desc := DescribeRequest(req)
+	if !strings.Contains(desc, "unknown fields") || !strings.Contains(desc, "9 (wire 0)") {
+		t.Errorf("DescribeRequest dropped the reference's unknown fields:\n%s", desc)
+	}
+}
+
+func TestTrajectoryField4IsEmittedOnlyWhenPresent(t *testing.T) {
+	// The captured shape round-trips byte for byte.
+	w := pb.NewWriter()
+	w.Message(reqTrajectoryRef, func(ref *pb.Writer) {
+		ref.String(trTrajectoryID, "8f0c9cba-6fde-4d1f-a4e9-1f2b3c4d5e6f")
+		ref.Enum(trTrajectoryType, 4)
+		ref.Varint(trField4, 14)
+	})
+	req := DecodeGetChatMessageRequest(w.Bytes())
+	if req.TrajectoryRef == nil || !req.TrajectoryRef.field4Set {
+		t.Fatal("a decoded field 4 did not set its presence flag")
+	}
+	if back := EncodeGetChatMessageRequest(req); !bytes.Equal(back, w.Bytes()) {
+		t.Errorf("round trip changed the reference: %x != %x", back, w.Bytes())
+	}
+
+	// A reference whose wire form lacked field 4 must not grow one on the way
+	// back out: re-encoding absence as an explicit zero changes what the
+	// backend sees.
+	w = pb.NewWriter()
+	w.Message(reqTrajectoryRef, func(ref *pb.Writer) {
+		ref.String(trTrajectoryID, "8f0c9cba-6fde-4d1f-a4e9-1f2b3c4d5e6f")
+		ref.Enum(trTrajectoryType, 4)
+	})
+	req = DecodeGetChatMessageRequest(w.Bytes())
+	if req.TrajectoryRef == nil || req.TrajectoryRef.field4Set {
+		t.Fatal("field 4 was marked present without being on the wire")
+	}
+	if back := EncodeGetChatMessageRequest(req); !bytes.Equal(back, w.Bytes()) {
+		t.Errorf("round trip invented field 4: %x != %x", back, w.Bytes())
+	}
+
+	// A reference built in code always carries the captured value.
+	req = &GetChatMessageRequest{TrajectoryRef: NewTrajectoryReference()}
+	raw := EncodeGetChatMessageRequest(req)
+	if !bytes.Contains(raw, []byte{trField4 << 3, 14}) {
+		t.Errorf("a built reference lost field 4: %x", raw)
 	}
 }
 

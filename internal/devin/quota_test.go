@@ -59,12 +59,16 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 // coolingUntilFor reads one slot's cooldown deadline, which is what distinguishes a
-// 30-second hold from one that runs to the next reset.
+// 30-second hold from one that runs to the next reset. The rotation lock is taken
+// here rather than the slot's slice read bare, because Remove renumbers the
+// cooling slice under that lock. An out-of-range slot reads as zero: never cooled.
 func coolingUntilFor(p *Pool, idx int) time.Time {
 	p.rot.mu.Lock()
 	defer p.rot.mu.Unlock()
-	until, _ := p.rot.coolingUntil(idx, time.Now())
-	return until
+	if idx < 0 || idx >= len(p.rot.cooling) {
+		return time.Time{}
+	}
+	return p.rot.cooling[idx]
 }
 
 func TestQuotaCooldownHoldsAnExhaustedAccountUntilItsReset(t *testing.T) {
@@ -295,6 +299,65 @@ func TestQuotaStatusIsOnlyFetchedAfterARefusal(t *testing.T) {
 				t.Fatalf("status fetched %d times, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestQuotaBookkeepingSurvivesConcurrentRemovals is the stress test behind the
+// lock discipline in refreshQuota, Remember and applyQuota: all of them resolve
+// a slot and act on it, and a Removal running between the two used to be able
+// to renumber the per-slot slices under them — an out-of-range index in an
+// unrecovered goroutine, or quota state landing on the wrong account. Any
+// regression back to carrying an index across a lock handoff shows up here as a
+// panic, given enough iterations.
+func TestQuotaBookkeepingSurvivesConcurrentRemovals(t *testing.T) {
+	p := poolOf(4)
+	var calls atomic.Int32
+	p.SetStatusSource(func(ctx context.Context, creds *Credentials) (*AccountStatus, error) {
+		calls.Add(1)
+		// A real fetch takes long enough for the list to change under it.
+		time.Sleep(time.Millisecond)
+		return statusAt(time.Now().Add(50*time.Millisecond), 0), nil
+	})
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				// A 429 is what sends refreshQuota off to the backend while the
+				// membership churns; Remember and applyQuota land later, on the
+				// answer.
+				creds := p.Next()
+				p.Report(creds, 429, nil)
+				p.Remember(creds, &AccountStatus{Email: "someone@example.com"})
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			p.Remove(i % max(1, p.Len()))
+			p.Add(tokenAt(100 + i))
+			p.RemoveCredential(p.CredentialAt(0))
+			p.Add(tokenAt(300 + i))
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		wg.Wait()
+	case <-time.After(30 * time.Second):
+		t.Fatal("the churn deadlocked; a lock order inverted somewhere")
+	}
+	// Whatever the churn, the per-slot slices must still agree with the entries
+	// they index: that len invariant is what applyQuota and ClearCooldown lean on.
+	if len(p.busy) != p.Len() || len(p.quotaCoolUntil) != p.Len() || len(p.rot.cooling) != p.Len() {
+		t.Fatalf("slices diverged: %d busy, %d quota, %d cooling, %d entries",
+			len(p.busy), len(p.quotaCoolUntil), len(p.rot.cooling), p.Len())
 	}
 }
 

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
@@ -16,9 +17,11 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"devin2proxy/internal/dashboard"
@@ -155,11 +158,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	applyEnv(&cfg)
+	// Environment-provided keys are applied first: in the container deployment
+	// the config file carries no key at all, so printing before applyEnv would
+	// print an empty line for exactly the deployment -print-key is asked in.
 	if *printKey {
 		fmt.Println(cfg.APIKey)
 		return
 	}
-	applyEnv(&cfg)
 	if *addr != "" {
 		cfg.Addr = *addr
 	}
@@ -242,7 +248,12 @@ func main() {
 		// With more than one account, a 429 is answered by trying the next account
 		// rather than by waiting out a backoff against the one that just refused. A
 		// single account has no alternative to offer, so it keeps the full budget.
-		RateLimitRetries: rateLimitRetries(pool),
+		// Read live rather than sampled once: accounts added through the dashboard
+		// after start-up should shrink the backoff budget the same way accounts
+		// loaded at start-up do.
+		RateLimitRetriesFunc: func() int {
+			return rateLimitRetries(pool)
+		},
 	})
 
 	// Quota-aware cooldowns need the client to reach the status endpoint, so this
@@ -317,6 +328,7 @@ func main() {
 			log.Fatalf("tls: %v", err)
 		}
 		warnCertExpiry(tlsCert, certPath)
+		warnUncoveredNames(tlsCert, names, certPath)
 		if generated {
 			log.Printf("tls: generated a self-signed certificate at %s", certPath)
 		}
@@ -342,24 +354,58 @@ func main() {
 		Addr:              cfg.Addr,
 		Handler:           srv,
 		ReadHeaderTimeout: 30 * time.Second,
-		// No WriteTimeout: completions legitimately stream for minutes.
+		// No WriteTimeout: completions legitimately stream for minutes. Idle
+		// keep-alive connections are a different story — on an exposed listener
+		// every port scanner and dead client would otherwise hold a goroutine
+		// and an FD indefinitely, since a zero IdleTimeout falls back to a zero
+		// ReadTimeout, i.e. no reaping at all.
+		IdleTimeout: 120 * time.Second,
 	}
+
+	// SIGTERM (docker stop, a redeploy, a VM shutdown) and SIGINT stop taking
+	// new requests and give in-flight completions a grace period to finish,
+	// instead of severing streams that legitimately run for minutes. The
+	// per-request context cancellation the handlers already propagate makes the
+	// hard-exit path after the grace period clean up upstream connections too.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	if useTLS {
 		httpSrv.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{tlsCert},
 			MinVersion:   tls.VersionTLS12,
 		}
-		// The certificate is already loaded; naming files here would read a
-		// second copy from disk.
-		if err := httpSrv.ListenAndServeTLS("", ""); err != nil {
+	}
+	serveErr := make(chan error, 1)
+	go func() {
+		if useTLS {
+			// The certificate is already loaded; naming files here would read a
+			// second copy from disk.
+			serveErr <- httpSrv.ListenAndServeTLS("", "")
+			return
+		}
+		serveErr <- httpSrv.ListenAndServe()
+	}()
+	select {
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("serve: %v", err)
 		}
-		return
-	}
-	if err := httpSrv.ListenAndServe(); err != nil {
-		log.Fatalf("serve: %v", err)
+	case <-ctx.Done():
+		log.Printf("shutdown: signal received; draining in-flight requests (up to %s)", shutdownGrace)
+		stop() // restore default signal handling: a second Ctrl-C means "stop now"
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown: %v; remaining connections are being closed", err)
+			httpSrv.Close()
+		}
 	}
 }
+
+// shutdownGrace bounds how long a draining server waits for completions that
+// legitimately stream for minutes. Long enough for the common tail, short
+// enough that a redeploy does not look hung.
+const shutdownGrace = 25 * time.Second
 
 // warnIfExposed says plainly what binding to a non-loopback address means. It is
 // a warning rather than a refusal because serving a LAN is a legitimate setup, but

@@ -118,7 +118,6 @@
         if (v === null || v === undefined || v === false) continue;
         if (k === "class") node.className = v;
         else if (k === "text") node.textContent = v;
-        else if (k === "html") node.innerHTML = v;
         else if (k.slice(0, 2) === "on") node.addEventListener(k.slice(2), v);
         else if (k === "value") node.value = v;
         else if (v === true) node.setAttribute(k, "");
@@ -128,6 +127,10 @@
     for (var i = 2; i < arguments.length; i++) append(node, arguments[i]);
     return node;
   }
+
+  // There is deliberately no innerHTML path here: every value the page renders
+  // goes through textContent or createTextNode, so nothing the backend echoes
+  // back — an error message, a model name — is ever parsed as markup.
 
   function append(node, kid) {
     if (kid === null || kid === undefined || kid === false) return;
@@ -239,7 +242,6 @@
     logsPolledOnce: false,
     logFilter: { kind: "", level: "", q: "" },
     logTimer: null,
-    dropped: 0,
     overviewTimer: null,
     // The session token the login response handed us, kept beside the cookie
     // for browsers that will not store an insecure cookie on a remote http
@@ -394,7 +396,7 @@
       ["accounts", accounts, S.accountMeta.using_cli_creds ? "using the CLI's own credential" : S.accountMeta.available + " available"],
       ["routes", routes, S.proxyPanel ? S.proxyPanel.available + " available" : ""],
       ["quota holds", S.accountMeta.quota_held || 0, S.info && S.info.quota_cooldown ? "quota cooldown on" : "quota cooldown off"],
-      ["log events", S.logs.length, "newest first · every 3s" + (S.dropped ? " · " + S.dropped + " dropped for a slow reader" : "")]
+      ["log events", S.logs.length, "newest first · every 3s"]
     ];
     stats.forEach(function (s) {
       node.appendChild(el("div", { class: "stat" },
@@ -1383,8 +1385,7 @@
     if (!marker) return;
     var matched = shown === undefined ? S.logs.filter(logMatches).length : shown;
     marker.textContent = matched + " of " + S.logs.length + " events" +
-      (S.logsPaused ? " (paused; the stream keeps running)" : "") +
-      (S.dropped ? " · " + S.dropped + " dropped for a slow reader" : "");
+      (S.logsPaused ? " (paused; the stream keeps running)" : "");
   }
 
   // logCap is how many events the view keeps. Older ones are pruned as new ones
@@ -1420,7 +1421,6 @@
       if (err.status === 401) { stopStream(); await boot(); }
       return;
     }
-    if (typeof data.dropped === "number") S.dropped = data.dropped;
     var fresh = data.events || [];
     var seen = {};
     S.logs.forEach(function (e) { seen[e.seq] = true; });
@@ -1453,7 +1453,6 @@
     try {
       var data = await api("/overview");
       S.info = data.info;
-      S.dropped = (data.events && data.events.dropped) || 0;
       renderStats();
     } catch (err) {
       if (err.status === 401) { stopStream(); await boot(); }

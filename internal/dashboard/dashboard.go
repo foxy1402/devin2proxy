@@ -203,9 +203,6 @@ func (d *Dashboard) routes() {
 
 func (d *Dashboard) ServeHTTP(w http.ResponseWriter, r *http.Request) { d.mux.ServeHTTP(w, r) }
 
-// Handler returns the dashboard for mounting under its prefix.
-func (d *Dashboard) Handler() http.Handler { return d }
-
 // guard enforces the two rules that apply to every data endpoint: the request has
 // to come from this machine (unless remote access was asked for), and it has to
 // carry a valid session.
@@ -278,6 +275,15 @@ func (d *Dashboard) handleSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
+	// The same origin check guard applies. Login is not behind guard, so without
+	// this a cross-site form (enctype="text/plain" needs no CORS preflight) could
+	// drive wrong-password guesses at will, and every strike refreshes a ban that
+	// persists for a day — an attacker could keep the operator's own address locked
+	// out without ever guessing right.
+	if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+		d.deny(w, r, http.StatusForbidden, "cross-origin request refused")
+		return
+	}
 	addr := clientAddr(r)
 	if !d.cfg.AllowRemote && !isLoopbackAddr(r.RemoteAddr) {
 		d.deny(w, r, http.StatusForbidden, "the dashboard is reachable from this machine only")
@@ -348,11 +354,22 @@ func (d *Dashboard) handleLogin(w http.ResponseWriter, r *http.Request) {
 func (d *Dashboard) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// Bumping the epoch invalidates every session, not just this browser's, which
 	// is what makes logging out mean something if a cookie has been copied.
-	if _, err := d.cfg.Store.BumpSessionEpoch(); err != nil {
-		d.deny(w, r, http.StatusInternalServerError, "could not end the session: "+err.Error())
+	_, err := d.cfg.Store.BumpSessionEpoch()
+	// The epoch moved, so the session is already dead in memory whether or not the
+	// change reached the disk: answering 500 here would report a sign-out that
+	// succeeded as a failure, and would leave the cookie in place. It is cleared
+	// either way; a save that failed is a warning, not a refused sign-out. The
+	// epoch is bumped again by the next logout, so the disk catches up then.
+	d.clearSessionCookie(w, r)
+	if err != nil {
+		d.logf("dashboard: %s signed out; all sessions invalidated, but persisting the change failed: %v",
+			clientAddr(r), err)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"authenticated": false,
+			"warning":       "signed out, but persisting the change failed: " + err.Error(),
+		})
 		return
 	}
-	d.clearSessionCookie(w, r)
 	d.logf("dashboard: %s signed out; all sessions invalidated", clientAddr(r))
 	writeJSON(w, http.StatusOK, map[string]any{"authenticated": false})
 }
@@ -381,7 +398,6 @@ func (d *Dashboard) handleOverview(w http.ResponseWriter, r *http.Request) {
 		},
 		"events": map[string]any{
 			"enabled": d.cfg.Events != nil,
-			"dropped": d.cfg.Events.Dropped(),
 		},
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -427,7 +443,6 @@ func (d *Dashboard) handleLogsRecent(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"events":  all,
-		"dropped": d.cfg.Events.Dropped(),
 		"enabled": true,
 	})
 }
@@ -448,7 +463,9 @@ func (d *Dashboard) logf(format string, args ...any) {
 }
 
 // decodeBody reads a bounded JSON body, so a huge one cannot be used to exhaust
-// memory through the dashboard.
+// memory through the dashboard. Nothing may follow the one JSON value: a decoder
+// stops at the end of the first document, and without this check the rest of the
+// body would be accepted and quietly ignored.
 func decodeBody(r *http.Request, dst any) error {
 	defer r.Body.Close()
 	// A limit rather than MaxBytesReader: the decoder rejects a truncated document
@@ -457,6 +474,9 @@ func decodeBody(r *http.Request, dst any) error {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dst); err != nil {
 		return errors.New("invalid request body: " + err.Error())
+	}
+	if dec.More() {
+		return errors.New("invalid request body: unexpected trailing data")
 	}
 	return nil
 }

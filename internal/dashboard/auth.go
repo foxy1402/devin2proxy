@@ -104,7 +104,8 @@ func verifyPassword(rec *passwordRecord, password string) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
-// loginState is what the UI needs to explain a locked-out login.
+// loginState is what the UI needs to explain a locked-out login. The page renders
+// the wait itself from Until, so no second, seconds-granularity copy of it is sent.
 type loginState struct {
 	Banned bool      `json:"banned"`
 	Until  time.Time `json:"until,omitempty"`
@@ -112,8 +113,6 @@ type loginState struct {
 	Strikes int `json:"strikes"`
 	// Remaining is how many attempts are left before the next ban.
 	Remaining int `json:"remaining"`
-	// WaitSeconds is how long until the ban lifts, for a countdown.
-	WaitSeconds int `json:"wait_seconds,omitempty"`
 }
 
 // loginStateFor reports the current state for a client address without changing
@@ -130,7 +129,6 @@ func (d *Dashboard) loginStateFor(addr string) loginState {
 	if rec.Until.After(now) {
 		st.Banned = true
 		st.Until = rec.Until
-		st.WaitSeconds = int(rec.Until.Sub(now).Seconds()) + 1
 	}
 	return st
 }
@@ -176,7 +174,6 @@ func (d *Dashboard) recordLoginFailure(addr string) loginState {
 	if rec.Until.After(now) {
 		st.Banned = true
 		st.Until = rec.Until
-		st.WaitSeconds = int(rec.Until.Sub(now).Seconds()) + 1
 	}
 	d.cfg.Store.forgetStaleBans(now)
 	err := d.cfg.Store.save()

@@ -36,6 +36,15 @@ func (d *Dashboard) handleUI(w http.ResponseWriter, r *http.Request) {
 	// otherwise enforce are stated here rather than relaxed later.
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Referrer-Policy", "no-referrer")
+	// A default-deny content policy shaped to what the page actually does: one
+	// inline script and one inline stylesheet, fetches to this origin and nothing
+	// else — no images, no frames, no other hosts. The page keeps a full-access
+	// session token in sessionStorage, so anything that could load a script from
+	// somewhere else would be a way out with that token; the policy closes that
+	// door even if a later edit reaches for one.
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "+
+			"connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'")
 	w.WriteHeader(http.StatusOK)
 	w.Write(uiHTML)
 }

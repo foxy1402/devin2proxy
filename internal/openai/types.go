@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // ----------------------------------------------------------------- requests
@@ -25,8 +26,16 @@ type ChatRequest struct {
 	Tools               []Tool          `json:"tools"`
 	ToolChoice          json.RawMessage `json:"tool_choice"`
 	StreamOptions       *StreamOptions  `json:"stream_options"`
-	User                string          `json:"user"`
 	N                   *int            `json:"n"`
+	// ResponseFormat and the sampling knobs below are accepted so a client that
+	// sends them is not told the field is unknown, but the backend has no
+	// equivalent for any of them. BuildDevinRequest reports the ones a request
+	// actually carries — once, in one line — instead of either refusing them or
+	// applying them silently while the client believes otherwise.
+	ResponseFormat   json.RawMessage `json:"response_format"`
+	FrequencyPenalty *float64        `json:"frequency_penalty"`
+	PresencePenalty  *float64        `json:"presence_penalty"`
+	Seed             *int            `json:"seed"`
 }
 
 type StreamOptions struct {
@@ -118,13 +127,42 @@ func (c *Content) UnmarshalJSON(b []byte) error {
 					"the backend cannot fetch %q", p.ImageURL.URL)
 			}
 			c.Images = append(c.Images, img)
+		default:
+			// Unknown parts used to be dropped silently, which can erase a whole
+			// user turn when the text rode on the dropped part. OpenAI's own API
+			// rejects an unknown part type, and a refusal that names the type
+			// tells the client what to fix instead of answering as though the
+			// content never existed.
+			return fmt.Errorf("content part type %q is not supported: only text and image parts are accepted", p.Type)
 		}
 	}
 	return nil
 }
 
-// MarshalJSON always writes a plain string, matching what clients expect back.
-func (c Content) MarshalJSON() ([]byte, error) { return json.Marshal(c.Text) }
+// MarshalJSON writes a plain string, matching what clients expect back — except
+// when the content carries inline images. Then it writes the array-of-parts
+// shape the request itself arrived in: a multimodal request captured as a bare
+// string would lose the images entirely, and the request-capture feature exists
+// so a failing request can be replayed and bisected offline. The parts shape is
+// exactly what UnmarshalJSON accepts, so a capture round-trips.
+func (c Content) MarshalJSON() ([]byte, error) {
+	if len(c.Images) == 0 {
+		return json.Marshal(c.Text)
+	}
+	parts := make([]contentPart, 0, len(c.Images)+1)
+	if c.Text != "" {
+		parts = append(parts, contentPart{Type: "text", Text: c.Text})
+	}
+	for _, img := range c.Images {
+		parts = append(parts, contentPart{
+			Type: "image_url",
+			ImageURL: &struct {
+				URL string `json:"url"`
+			}{URL: "data:" + img.MediaType + ";base64," + img.MIMEBase64},
+		})
+	}
+	return json.Marshal(parts)
+}
 
 // parseDataURL splits a data: URL into its media type and base64 payload. Only
 // inline data is supported: the backend takes base64 image bytes, not URLs.
@@ -165,11 +203,36 @@ func parseDataURL(u string) (Image, bool) {
 // were unreadable, which is indistinguishable from a model that cannot see
 // images at all. Only PNG and JPEG are sniffed, since those are what a data: URL
 // carries in practice; anything else is left at zero.
-func imageSize(b64 string) (uint64, uint64) {
+// imageHeaderBytes is how much decoded image data the dimension sniffer can
+// ever need: a PNG's IHDR sits in the first 24 bytes, and a JPEG's
+// start-of-frame marker precedes the scan data, comfortably inside a few KiB.
+// Sniffing from a prefix keeps a multi-megabyte data URL — already buffered
+// whole in the request body — from being decoded a second time just to read a
+// header.
+const imageHeaderBytes = 8 << 10
+
+// decodeImageHeader decodes roughly the first imageHeaderBytes of the payload.
+// The URL-safe alphabet appears in real data URLs, and the sniffer only reads
+// bytes, so it is normalised to the standard alphabet rather than rejected; the
+// string is cut to whole base64 quanta first, so a prefix decodes without
+// needing the padding that only the final quantum carries.
+func decodeImageHeader(b64 string) []byte {
+	if strings.ContainsAny(b64, "-_") {
+		b64 = strings.NewReplacer("-", "+", "_", "/").Replace(b64)
+	}
+	if n := (imageHeaderBytes/3 + 1) * 4; len(b64) > n {
+		b64 = b64[:n]
+	}
+	b64 = b64[:len(b64)-len(b64)%4]
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
-		return 0, 0
+		return nil
 	}
+	return raw
+}
+
+func imageSize(b64 string) (uint64, uint64) {
+	raw := decodeImageHeader(b64)
 	// PNG: an 8-byte signature, then the IHDR chunk whose type is followed by
 	// width and height as big-endian uint32.
 	if len(raw) >= 24 && bytes.Equal(raw[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) &&
@@ -302,7 +365,6 @@ type ErrorResponse struct {
 type ErrorDetail struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
-	Param   string `json:"param,omitempty"`
 	Code    string `json:"code,omitempty"`
 }
 

@@ -28,7 +28,9 @@ func EmitRequestShape(req *GetChatMessageRequest) {
 // decide whether this backend serves it or refuses it: the model, the prompt
 // split, the tool and image counts, and every sampling field (a present-but-
 // zero sampling field is a rejection, which is why they are printed even when
-// they look boring).
+// they look boring). The trajectory/cascade pair is on the line too, because a
+// request carrying neither is a documented hard rejection: the diff between a
+// refused request and a served one has to show which of the two each presented.
 func (r *GetChatMessageRequest) ShapeLine() string {
 	if r == nil {
 		return "<nil request>"
@@ -48,9 +50,16 @@ func (r *GetChatMessageRequest) ShapeLine() string {
 		promptBytes += len(p.Prompt)
 		images += len(p.Images)
 	}
+	traj, cascade := "absent", "absent"
+	if r.TrajectoryRef != nil {
+		traj = "present"
+	}
+	if r.CascadeID != "" {
+		cascade = "present"
+	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "model=%s rtype=%d planner=%d prompts=%d(user=%d system=%d tool=%d) tools=%d images=%d turn_bytes=%d system_bytes=%d",
-		r.ChatModelUID, r.RequestType, r.PlannerMode,
+	fmt.Fprintf(&b, "model=%s rtype=%d planner=%d traj=%s cascade=%s prompts=%d(user=%d system=%d tool=%d) tools=%d images=%d turn_bytes=%d system_bytes=%d",
+		r.ChatModelUID, r.RequestType, r.PlannerMode, traj, cascade,
 		len(r.ChatMessagePrompts), user, system, tool,
 		len(r.Tools), images, promptBytes, len(r.Prompt))
 	if c := r.Configuration; c != nil {

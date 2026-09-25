@@ -122,3 +122,53 @@ func TestTheSignInButtonIsNotATypelessSubmitButton(t *testing.T) {
 		t.Error("the Sign in button has no explicit type; inside the form it submits, double-firing the login")
 	}
 }
+
+// The login endpoint is reachable without guard, so it has to apply guard's
+// origin rule itself. Without it a cross-site form — enctype="text/plain" needs
+// no CORS preflight — could drive wrong-password guesses without limit, and every
+// strike refreshes a ban that can keep the operator's own address locked out for
+// a day.
+func TestACrossOriginLoginIsRefused(t *testing.T) {
+	d := testDashboard(t)
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/api/login",
+		strings.NewReader(`{"password":"correct-horse-battery"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://evil.example")
+	req.RemoteAddr = "127.0.0.1:54321"
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("a cross-origin login: status %d, want 403 (body %s)", rec.Code, rec.Body)
+	}
+	// The refusal must have happened before anything was decided: no session was
+	// issued, and no strike was recorded for the guessed password.
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value != "" {
+			t.Error("a refused cross-origin login issued a session cookie")
+		}
+	}
+	if state := d.loginStateFor("127.0.0.1"); state.Strikes != 0 {
+		t.Errorf("a refused cross-origin login recorded %d strikes", state.Strikes)
+	}
+}
+
+// The check must only ever be about a cross-site claim: a client that sends no
+// Origin header at all (curl, a test) and one that names this host both work.
+func TestALoginWithoutACrossOriginHeaderIsServed(t *testing.T) {
+	d := testDashboard(t)
+	// No Origin header at all — the way curl and this test suite send it.
+	if rec := post(t, d, "/dashboard/api/login", map[string]string{"password": "correct-horse-battery"}); rec.Code != http.StatusOK {
+		t.Fatalf("login with no Origin header: status %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+	// The dashboard's own origin, the way its page sends it.
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/api/login",
+		strings.NewReader(`{"password":"correct-horse-battery"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "http://"+req.Host)
+	req.RemoteAddr = "127.0.0.1:54321"
+	rec := httptest.NewRecorder()
+	d.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a same-origin login: status %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+}

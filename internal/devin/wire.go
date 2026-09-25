@@ -104,22 +104,19 @@ const (
 // issues". The real CLI likewise sends a whole conversation as USER prompts,
 // carrying non-user context in XML-ish tags inside the prompt text.
 const (
-	SourceUnspecified = 0
-	SourceUser        = 1
-	SourceSystem      = 2
-	SourceTool        = 4
+	SourceUser   = 1
+	SourceSystem = 2
+	SourceTool   = 4
 )
 
 // ChatMessageRequestType values (GetChatMessageRequest.request_type).
 const (
-	RequestTypeUnspecified = 0
-	RequestTypeCascade     = 5
+	RequestTypeCascade = 5
 )
 
 // ConversationalPlannerMode values (GetChatMessageRequest.planner_mode).
 const (
-	PlannerModeUnspecified = 0
-	PlannerModeDefault     = 1
+	PlannerModeDefault = 1
 )
 
 // StopReason values (GetChatMessageResponse.stop_reason). StopNormal was
@@ -240,11 +237,19 @@ const (
 
 // TrajectoryReference points the request at a Cortex trajectory. The capture
 // shows {trajectory_id: <uuid>, trajectory_type: 4, field4: 14}. Field 4's
-// meaning is unknown; it is round-tripped faithfully.
+// meaning is unknown; it is round-tripped faithfully — a reference decoded from
+// the wire re-emits field 4 only when the wire carried it, so decoding does not
+// invert an absent field into an explicit zero, while a reference built in code
+// always sends the captured value.
 type TrajectoryReference struct {
 	TrajectoryID   string
 	TrajectoryType int
 	Field4         int
+
+	// field4Set records that field 4 was on the wire (or that the reference
+	// came from NewTrajectoryReference, which always sets it): Field4's zero
+	// value alone cannot be told apart from a field the sender omitted.
+	field4Set bool
 
 	Unknown []UnknownField
 }
@@ -291,6 +296,7 @@ func NewTrajectoryReference() *TrajectoryReference {
 		TrajectoryID:   MustUUID(),
 		TrajectoryType: 4,
 		Field4:         14,
+		field4Set:      true,
 	}
 }
 
@@ -310,6 +316,13 @@ type GetChatMessageRequest struct {
 	// Unknown records fields we did not recognise, so a schema mismatch shows
 	// up as a log line instead of silently dropping data.
 	Unknown []UnknownField
+
+	// truncated records that the message ran out mid-field, mirroring the
+	// response flag. The field loop cannot tell a clean end from a parse
+	// error on its own, and a partial frame must never be presented as a
+	// complete one: DescribeRequest says so, and the repeated-field decoders
+	// refuse to append the zero value a failed read returns.
+	truncated bool
 }
 
 type GetChatMessageResponse struct {
@@ -471,6 +484,7 @@ func decodeTrajectoryReference(b []byte) *TrajectoryReference {
 			out.TrajectoryType = int(r.Varint())
 		case f == trField4 && w == pb.WireVarint:
 			out.Field4 = int(r.Varint())
+			out.field4Set = true
 		default:
 			out.Unknown = append(out.Unknown, recordUnknown(f, w, r))
 		}
@@ -580,7 +594,9 @@ func decodeModelUsageStats(b []byte) *ModelUsageStats {
 	return out
 }
 
-// DecodeGetChatMessageRequest parses one GetChatMessageRequest message.
+// DecodeGetChatMessageRequest parses one GetChatMessageRequest message. A frame
+// that ends mid-field still returns the part that parsed, with truncated set so
+// it is never mistaken for a complete request.
 func DecodeGetChatMessageRequest(b []byte) *GetChatMessageRequest {
 	out := &GetChatMessageRequest{}
 	r := pb.NewReader(b)
@@ -595,13 +611,19 @@ func DecodeGetChatMessageRequest(b []byte) *GetChatMessageRequest {
 		case f == reqPrompt && w == pb.WireBytes:
 			out.Prompt = r.String()
 		case f == reqChatMessagePrompts && w == pb.WireBytes:
-			out.ChatMessagePrompts = append(out.ChatMessagePrompts, decodeChatMessagePrompt(r.Bytes()))
+			// Commit an entry only when it parsed: appending the empty prompt
+			// a failed read returns would invent a turn the client never sent.
+			if raw := r.Bytes(); r.Err() == nil {
+				out.ChatMessagePrompts = append(out.ChatMessagePrompts, decodeChatMessagePrompt(raw))
+			}
 		case f == reqRequestType && w == pb.WireVarint:
 			out.RequestType = int(r.Varint())
 		case f == reqConfiguration && w == pb.WireBytes:
 			out.Configuration = decodeCompletionConfiguration(r.Bytes())
 		case f == reqTools && w == pb.WireBytes:
-			out.Tools = append(out.Tools, decodeChatToolDefinition(r.Bytes()))
+			if raw := r.Bytes(); r.Err() == nil {
+				out.Tools = append(out.Tools, decodeChatToolDefinition(raw))
+			}
 		case f == reqTrajectoryRef && w == pb.WireBytes:
 			out.TrajectoryRef = decodeTrajectoryReference(r.Bytes())
 		case f == reqCascadeID && w == pb.WireBytes:
@@ -616,6 +638,7 @@ func DecodeGetChatMessageRequest(b []byte) *GetChatMessageRequest {
 			out.Unknown = append(out.Unknown, recordUnknown(f, w, r))
 		}
 	}
+	out.truncated = r.Err() != nil
 	return out
 }
 
@@ -821,7 +844,14 @@ func EncodeGetChatMessageRequest(in *GetChatMessageRequest) []byte {
 		sub := pb.NewWriter()
 		sub.String(trTrajectoryID, in.TrajectoryRef.TrajectoryID)
 		sub.Enum(trTrajectoryType, in.TrajectoryRef.TrajectoryType)
-		sub.Varint(trField4, uint64(in.TrajectoryRef.Field4))
+		// Field 4 goes out only when the reference actually carries it:
+		// field4Set covers a decoded reference (even one whose field 4 was an
+		// explicit 0), and the non-zero check covers struct literals, which
+		// cannot set the unexported flag but do set the captured 14. Emitting
+		// an absent field as an explicit 0 would change what the backend sees.
+		if in.TrajectoryRef.field4Set || in.TrajectoryRef.Field4 != 0 {
+			sub.Varint(trField4, uint64(in.TrajectoryRef.Field4))
+		}
 		w.RawBytes(reqTrajectoryRef, sub.Bytes())
 	}
 	w.String(reqCascadeID, in.CascadeID)
@@ -837,6 +867,11 @@ func EncodeGetChatMessageRequest(in *GetChatMessageRequest) []byte {
 func DescribeRequest(in *GetChatMessageRequest) string {
 	var sb strings.Builder
 	sb.WriteString("GetChatMessageRequest\n")
+	if in.truncated {
+		// A half frame must not pass for a whole one: everything below is
+		// only the part that happened to parse.
+		sb.WriteString("  truncated           : the frame ended mid-field; the values below are the part that parsed\n")
+	}
 	if m := in.Metadata; m != nil {
 		fmt.Fprintf(&sb, "  metadata            : ide_name=%q ext_ver=%q api_key=%s locale=%q os=%q ide_ver=%q ext_name=%q\n",
 			m.IDEName, m.ExtensionVersion, redactSecret(m.APIKey), m.Locale, m.OS, m.IDEVersion, m.ExtensionName)
@@ -876,6 +911,10 @@ func DescribeRequest(in *GetChatMessageRequest) string {
 	fmt.Fprintf(&sb, "  cascade_id          : %q\n", in.CascadeID)
 	if tr := in.TrajectoryRef; tr != nil {
 		fmt.Fprintf(&sb, "  trajectory_reference: id=%q type=%d field4=%d\n", tr.TrajectoryID, tr.TrajectoryType, tr.Field4)
+		// The reference's own unknown fields go on the description too: a
+		// schema mismatch inside it is the same kind of silent drop as one at
+		// the top level.
+		writeUnknown(&sb, tr.Unknown)
 	} else {
 		sb.WriteString("  trajectory_reference: <absent>\n")
 	}

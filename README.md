@@ -104,7 +104,7 @@ sign in. Install the CLI from Devin's site, log in once, and copy the
 `windsurf_api_key` line:
 
 - Windows: `%APPDATA%\devin\credentials.toml`
-- Linux/macOS: `$XDG_CONFIG_HOME/devin/credentials.toml`, falling back to
+- Linux/macOS: `$XDG_DATA_HOME/devin/credentials.toml`, falling back to
   `~/.local/share/devin/credentials.toml`
 
 The token's JWT carries **no `exp` claim** — it does not expire — so this is a
@@ -154,7 +154,10 @@ config file** — which is what makes `read_only: true` work.
 | `DEVIN2PROXY_TLS_NAMES` | `tls_names` | — | extra SANs for the generated cert — the machine's public IP belongs here |
 | `DEVIN2PROXY_DASHBOARD` | `dashboard` | `1` | serve `/dashboard/` |
 | `DEVIN2PROXY_DASHBOARD_PASSWORD` | `dashboard_password` | generated, printed once | dashboard login |
-| `DEVIN2PROXY_DASHBOARD_ALLOW_REMOTE` | `dashboard_allow_remote` | `false` | allow the dashboard from outside the machine |
+| `DEVIN2PROXY_DASHBOARD_ALLOW_REMOTE` | `dashboard_allow_remote` | `false` | allow the dashboard from outside the machine; behind a reverse proxy on the same host every visitor appears loopback, so this also means every visitor passes the local-only guard and failed logins share one ban bucket — put the proxy's own auth in front |
+| `DEVIN2PROXY_DEVIN_CLI` | `devin_cli` | — | path to the `devin` CLI; shown in the dashboard's terminal command and run by its sign-out endpoint (the sign-in itself never needs it) |
+| `DEVIN2PROXY_DASHBOARD_WEBAPP_HOST` | `dashboard_webapp_host` | `app.devin.ai` | host serving `/auth/cli/continue`, for a non-default sign-in deployment |
+| `DEVIN2PROXY_DASHBOARD_ECHO_URL` | `dashboard_echo_url` | — | endpoint answering with the caller's address as plain text, fetched through a route when it is tested; `-` skips it |
 | `DEVIN2PROXY_MODEL` | `model` | `swe-1-6-slow` | default model; a non-backend uid is a start-up error |
 | `DEVIN2PROXY_MODELS` | `models` | `swe-1-6-slow, swe-1.6, swe` | advertised ids |
 | `DEVIN2PROXY_MIN_MAX_TOKENS` | `min_max_tokens` | `8192` | floor on a client's `max_tokens` — see [Models](#models) |
@@ -277,10 +280,12 @@ every request, and clients that don't know the field ignore it.
 | `max_tokens` / `max_completion_tokens` | honoured as a ceiling, raised to the `min_max_tokens` floor, not capped at the top |
 | `temperature` | honoured, clamped to `(0, 2]` — `0` is what IDEs send and the backend refuses it, so it becomes `0.001` |
 | `top_p` | honoured, clamped to `(0, 1]` |
-| `stop` | honoured, and cancels the upstream generation |
-| `stream`, `stream_options.include_usage` | honoured |
+| `stop` | honoured, and cancels the upstream generation; a wrongly-typed `stop` → `400` |
+| `stream`, `stream_options.include_usage` | honoured (the final `include_usage` chunk always carries `usage`, zeroed when the backend reported none) |
 | `tools`, `tool_choice: auto/none` | honoured; `required`/named-function → `400` (the backend has no field for it) |
-| `n`, `seed`, `logprobs`, `response_format`, penalties, `reasoning_effort` | ignored silently; unknown JSON fields are dropped, not rejected |
+| `response_format`, penalties, `seed` | accepted but **not enforced** — one log line per request notes the unenforced fields (JSON-mode clients get free-form prose) |
+| `n`, `logprobs`, `reasoning_effort` | ignored silently |
+| unknown JSON fields | dropped, not rejected; an unknown content-part type in a multimodal message → `400` |
 
 The context window is not a request parameter in OpenAI's API at all — set it
 in your IDE to at most 200k.
@@ -346,10 +351,11 @@ password:
 - **Proxies** — the route list; **Test each route** opens a real tunnel and
   reports the exit address. Passwords are shown masked and the mask round-trips
   (saving a masked list keeps the real credentials).
-- **Logs** — live SSE view of every request and the gateway's own log lines:
-  upstream status, account, route, duration, token counts, and the backend's
-  own error text — which matters because Devin reports refusals as HTTP 200
-  with the error inside the stream.
+- **Logs** — the most recent requests and the gateway's own log lines
+  (polled; the newest 1000 events are kept in memory): upstream status,
+  account, route, duration, token counts, and the backend's own error text —
+  which matters because Devin reports refusals as HTTP 200 with the error
+  inside the stream.
 
 State lives in `dashboard.json` beside the config, mode `0600`: password
 hash, session secret, managed accounts and routes, the failed-login record.

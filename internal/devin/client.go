@@ -7,8 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"math/rand/v2"
 	"net/http"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -42,6 +46,10 @@ type Client struct {
 	// accounts set it low, because spending the next second retrying an account
 	// that has just said "no quota" is worse than asking the next account.
 	rateLimitRetries int
+	// rateLimitRetriesFunc, when set, is consulted per request instead of the
+	// static rateLimitRetries, so a caller whose account count changes at runtime
+	// can keep the budget in step with it. See Options.RateLimitRetriesFunc.
+	rateLimitRetriesFunc func() int
 }
 
 // Options tunes the client. Zero values pick sensible defaults.
@@ -61,6 +69,12 @@ type Options struct {
 	// account instead, since a rate limit does not clear in the sub-second
 	// backoff a retry costs.
 	RateLimitRetries int
+	// RateLimitRetriesFunc, when set, replaces RateLimitRetries and is evaluated
+	// per request, so a caller whose account pool grows and shrinks at runtime
+	// can keep the budget in step with it instead of the value it sampled once
+	// at startup. Returning zero falls through to RateLimitRetries and its
+	// default, matching that field's own reading of zero.
+	RateLimitRetriesFunc func() int
 }
 
 func NewClient(opts Options) *Client {
@@ -71,9 +85,10 @@ func NewClient(opts Options) *Client {
 		opts.HeaderTimeout = 120 * time.Second
 	}
 	c := &Client{
-		direct:           newRouteTransport(nil, EgressOptions{HeaderTimeout: opts.HeaderTimeout}),
-		sem:              make(chan struct{}, opts.MaxConcurrent),
-		rateLimitRetries: opts.RateLimitRetries,
+		direct:               newRouteTransport(nil, EgressOptions{HeaderTimeout: opts.HeaderTimeout}),
+		sem:                  make(chan struct{}, opts.MaxConcurrent),
+		rateLimitRetries:     opts.RateLimitRetries,
+		rateLimitRetriesFunc: opts.RateLimitRetriesFunc,
 	}
 	c.SetEgress(opts.Egress)
 	return c
@@ -85,7 +100,9 @@ func (c *Client) Egress() *EgressPool { return c.egress.Load() }
 // SetEgress replaces the route pool. A request that is already in flight keeps
 // the transport it started on, so replacing the list cannot break it; the next
 // request walks the new list. A nil pool means the machine's own connection.
-func (c *Client) SetEgress(p *EgressPool) { c.egress.Store(p) }
+// The replaced pool is returned so the caller can release its idle
+// connections; a caller that ignores the result behaves as before.
+func (c *Client) SetEgress(p *EgressPool) *EgressPool { return c.egress.Swap(p) }
 
 // route picks the transport for one attempt, with the route it belongs to so the
 // caller can report the outcome against it. A nil route means the machine's own
@@ -115,7 +132,14 @@ func (c *Client) attempts() int {
 // rateLimitBudget is how many attempts one request may spend on 429s from the
 // same account. Callers with several accounts lower it to one, so the first
 // refusal sends the request to the next account rather than into a backoff.
+// A RateLimitRetriesFunc, when configured, is read here — per request — and
+// wins over the static value; a zero from either means the full default budget.
 func (c *Client) rateLimitBudget() int {
+	if c.rateLimitRetriesFunc != nil {
+		if n := c.rateLimitRetriesFunc(); n > 0 {
+			return n
+		}
+	}
 	if c.rateLimitRetries > 0 {
 		return c.rateLimitRetries
 	}
@@ -149,6 +173,10 @@ type Stream struct {
 	body    io.ReadCloser
 	release func()
 	closed  bool
+	// stopCleanup cancels the finalizer safety net registered when the stream
+	// was opened; Close runs before it returns so the resources are released
+	// exactly once. Nil for a stream built without one.
+	stopCleanup *runtime.Cleanup
 	// Route names the outbound route this stream was opened through, empty for the
 	// machine's own connection. It is recorded here rather than looked up later
 	// because the pool rotates per request: by the time a caller reports the
@@ -237,8 +265,12 @@ func (s *Stream) recv() (*GetChatMessageResponse, error) {
 			return nil, io.EOF
 		}
 		// Skip unknown frame flags rather than failing, so a new frame type
-		// does not break the proxy.
+		// does not break the proxy. Skipping silently is not an option either:
+		// a flag the backend starts setting on data frames — a compression bit,
+		// say — would otherwise drop every frame without a trace, so the skip
+		// is logged and a future change has somewhere to be noticed.
 		if flag != FrameData {
+			log.Printf("devin: skipping stream frame with unexpected flag 0x%02x (%d bytes)", flag, n)
 			continue
 		}
 		resp := DecodeGetChatMessageResponse(data)
@@ -259,6 +291,9 @@ func (s *Stream) Close() error {
 		return nil
 	}
 	s.closed = true
+	if s.stopCleanup != nil {
+		s.stopCleanup.Stop()
+	}
 	if s.release != nil {
 		s.release()
 	}
@@ -292,13 +327,56 @@ const (
 	retryBaseDelay        = 300 * time.Millisecond
 )
 
+// retryJitter is the uniform [0,1) sample the backoff is spread with. It is a
+// variable so a test can pin it; the default is math/rand/v2's package
+// generator, which is safe for concurrent use and needs no seeding.
+var retryJitter = rand.Float64
+
+// jitter spreads a wait over ±25% of itself. Several requests that failed
+// together retry together, and an unjittered ladder would send every one of
+// them back to the backend in the same millisecond; a spread breaks them up
+// without changing the shape of the ladder.
+func jitter(want time.Duration) time.Duration {
+	if want <= 0 {
+		return 0
+	}
+	spread := want / 4
+	return want - spread + time.Duration(retryJitter()*float64(2*spread))
+}
+
 func retryDelay(attempt int) time.Duration {
 	// attempt is 1-based and only called for attempt > 1: 300ms, then 900ms.
 	d := retryBaseDelay
 	for i := 2; i < attempt; i++ {
 		d *= 3
 	}
-	return d
+	return jitter(d)
+}
+
+// maxRetryAfter caps how long a Retry-After header may hold one attempt back.
+// The header is the server's estimate, not ours, and a misconfigured upstream
+// asking for minutes would otherwise park the request on a wait far longer
+// than the ladder it replaces.
+const maxRetryAfter = 15 * time.Second
+
+// parseRetryAfter reads the integer-seconds form of a Retry-After header — the
+// form this backend sends — and bounds it. Anything else (blank, not a number,
+// the HTTP-date form, negative) is ignored: the ladder is a fine default, and
+// guessing at a date format is worse than using it.
+func parseRetryAfter(v string) (time.Duration, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0, false
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs < 0 {
+		return 0, false
+	}
+	d := time.Duration(secs) * time.Second
+	if d > maxRetryAfter {
+		d = maxRetryAfter
+	}
+	return d, true
 }
 
 func (c *Client) postStream(ctx context.Context, creds *Credentials, payload []byte) (*Stream, error) {
@@ -318,10 +396,19 @@ func (c *Client) postStream(ctx context.Context, creds *Credentials, payload []b
 	// need time to clear.
 	wait := true
 	rateLimited := 0
+	// retryAfter carries a Retry-After deadline from the most recent 429 into the
+	// wait before the next attempt, replacing the ladder for that one wait. It is
+	// consumed on use, so a later refusal without the header falls back to the
+	// ladder rather than reusing a stale value.
+	var retryAfter time.Duration
 	for attempt := 1; attempt <= c.attempts(); attempt++ {
 		if attempt > 1 && wait {
+			delay := retryDelay(attempt)
+			if retryAfter > 0 {
+				delay, retryAfter = retryAfter, 0
+			}
 			select {
-			case <-time.After(retryDelay(attempt)):
+			case <-time.After(delay):
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
@@ -361,11 +448,31 @@ func (c *Client) postStream(ctx context.Context, creds *Credentials, payload []b
 			continue
 		}
 		if resp.StatusCode == http.StatusOK {
-			return &Stream{
+			s := &Stream{
 				body:    resp.Body,
 				release: func() { <-c.sem },
 				Route:   routeLabel(route),
-			}, nil
+			}
+			// A stream abandoned without Close holds its semaphore slot and its
+			// connection open for the life of the process, so a cleanup is
+			// registered as a safety net: if the stream becomes unreachable
+			// without having been closed, the slot is released and the body
+			// shut. The cleanup carries only the values it needs — never the
+			// stream itself, which would keep it reachable and stop the cleanup
+			// from ever running — and Close stops it before releasing the same
+			// resources itself, so exactly one of the two ever fires.
+			cleanup := runtime.AddCleanup(s, func(abandoned struct {
+				release func()
+				body    io.ReadCloser
+			}) {
+				abandoned.release()
+				abandoned.body.Close()
+			}, struct {
+				release func()
+				body    io.ReadCloser
+			}{release: s.release, body: s.body})
+			s.stopCleanup = &cleanup
+			return s, nil
 		}
 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
@@ -383,9 +490,21 @@ func (c *Client) postStream(ctx context.Context, creds *Credentials, payload []b
 		if rateLimited >= c.rateLimitBudget() {
 			return nil, lastErr
 		}
+		// The server said how long the refusal lasts, so honour it for the next
+		// wait instead of the ladder — bounded, and ignored entirely when the
+		// header carries something this proxy does not read.
+		if d, ok := parseRetryAfter(resp.Header.Get("Retry-After")); ok {
+			retryAfter = d
+		}
 	}
 	return nil, lastErr
 }
+
+// maxUnaryResponseBytes bounds how much of a unary response is read. The call
+// is a small protobuf answer in every known case; the bound is a malformed or
+// hostile backend defence, and reading one byte past it is how an overflow is
+// told apart from a response that exactly fits.
+const maxUnaryResponseBytes = 8 << 20
 
 // PostUnary sends a unary (non-streaming) Connect request, which uses a bare
 // protobuf body and the content type application/proto.
@@ -408,6 +527,17 @@ func (c *Client) PostUnary(ctx context.Context, creds *Credentials, path string,
 	httpReq.Header.Set("Authorization", BasicAuthValue(creds.APIKey))
 	httpReq.ContentLength = int64(len(payload))
 
+	// Unary calls take the same concurrency slot a stream does. Without this, a
+	// burst of catalogue or status calls would bypass the cap the semaphore
+	// exists to enforce, and those are exactly the calls a dashboard fan-out
+	// makes in a burst.
+	select {
+	case c.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-c.sem }()
+
 	// The catalogue call is made once at startup, not per request, so it takes the
 	// next route and no retry of its own; a route failure here is reported the
 	// same way a streaming one is, so a dead exit is cooled either way.
@@ -420,9 +550,16 @@ func (c *Client) PostUnary(ctx context.Context, creds *Credentials, path string,
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxUnaryResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("devin: read response: %w", err)
+	}
+	// LimitReader reads without complaining at the cap, so an oversized response
+	// would otherwise be handed back silently truncated — half a catalogue, say,
+	// with the rest missing and nothing to say so. One extra byte read is what
+	// turns that into an error.
+	if len(body) > maxUnaryResponseBytes {
+		return nil, fmt.Errorf("devin: unary response exceeds %d bytes", maxUnaryResponseBytes)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, &HTTPError{Status: resp.StatusCode, ContentType: resp.Header.Get("Content-Type"), Body: body}

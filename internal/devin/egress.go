@@ -149,10 +149,10 @@ func ProbeEgress(ctx context.Context, spec string, opts EgressOptions, backend, 
 // dialEgress opens the TCP connection a probe needs, using the route's own dialer
 // where it has one.
 //
-// A direct route has no dialer: its transport is left on Go's default, which is
-// reached through a nil DialContext rather than a function. Calling that field
-// directly is a nil dereference â€” it panicked a live dashboard request â€” so the
-// fallback here is the same dialer the transport would have used.
+// Every route's transport carries a DialContext — a proxied route's dialer, or
+// the timed plain dialer a direct route gets — but the fallback here keeps the
+// probe honest all the same: calling the field directly on a transport without
+// one is a nil dereference, and it panicked a live dashboard request once.
 func dialEgress(ctx context.Context, e *Egress, addr string, timeout time.Duration) (net.Conn, error) {
 	if e.tr.DialContext != nil {
 		return e.tr.DialContext(ctx, "tcp", addr)
@@ -204,7 +204,7 @@ const CredentialMask = "***:***"
 // stripEgressCredentials replaces user:pass in a URL with CredentialMask, leaving
 // the scheme and host intact. It works on the text rather than through url.URL,
 // because a URL round trip escapes the mask into %2A%2A%2A and the masked route is
-// meant to be readable â€” it is shown to a person and matched against what they
+// meant to be readable — it is shown to a person and matched against what they
 // pasted back.
 func stripEgressCredentials(spec string) string {
 	schemeEnd := strings.Index(spec, "://")
@@ -212,17 +212,23 @@ func stripEgressCredentials(spec string) string {
 		return spec
 	}
 	rest := spec[schemeEnd+3:]
+	// Userinfo can only live in the authority, which ends at the first slash,
+	// question mark or hash. Searching the whole remainder would let a later `@`
+	// in a path or query win LastIndex and leave real credentials behind, so the
+	// search stops where the authority does — and the path, query or fragment is
+	// carried over untouched behind the masked authority.
+	tail := ""
+	authority := rest
+	if end := strings.IndexAny(rest, "/?#"); end >= 0 {
+		authority = rest[:end]
+		tail = rest[end:]
+	}
 	// LastIndex, not Index: a password may legitimately contain an @.
-	at := strings.LastIndex(rest, "@")
+	at := strings.LastIndex(authority, "@")
 	if at < 0 {
 		return spec
 	}
-	// A path or query may also contain an @, so the userinfo only counts as one
-	// when it is before any slash.
-	if slash := strings.IndexAny(rest, "/?#"); slash >= 0 && slash < at {
-		return spec
-	}
-	return spec[:schemeEnd+3] + CredentialMask + "@" + rest[at+1:]
+	return spec[:schemeEnd+3] + CredentialMask + "@" + authority[at+1:] + tail
 }
 
 // HasMaskedCredentials reports whether a spec still carries the mask, which means
@@ -235,9 +241,15 @@ func HasMaskedCredentials(spec string) bool {
 // form of a route that is safe to display.
 func MaskSpec(spec string) string { return stripEgressCredentials(spec) }
 
+// hostOnly strips the port from a host:port pair. net.SplitHostPort is what
+// reads the pair rather than a LastIndex of ":", which a bare LastIndex mangles:
+// the colon in "[::1]:443" that LastIndex finds is the one before the port, but
+// the earlier colons inside the IPv6 literal are not separators, and trimming at
+// the last one the old way happened to work while trimming any other colon
+// would not. An input that is not host:port is returned as it came.
 func hostOnly(hostPort string) string {
-	if i := strings.LastIndex(hostPort, ":"); i > 0 {
-		return hostPort[:i]
+	if host, _, err := net.SplitHostPort(hostPort); err == nil {
+		return host
 	}
 	return hostPort
 }
@@ -258,6 +270,18 @@ type EgressPool struct {
 	// been sent. Its only reader is a listing, which uses it to show the order
 	// requests are walking in; a fresh pool must not claim a route was used.
 	last int
+}
+
+// Close releases the pool's idle connections. When a route list is replaced,
+// the old pool's transports would otherwise hold their pooled connections
+// until the idle timeout runs out on connections nothing will ever reuse.
+// In-flight requests are unaffected: their connections are not idle.
+func (p *EgressPool) Close() {
+	for _, e := range p.list {
+		if e.tr != nil {
+			e.tr.CloseIdleConnections()
+		}
+	}
 }
 
 // RouteState is one route as a listing needs it: what it is, whether it can be
@@ -408,13 +432,15 @@ func (p *EgressPool) Next() *Egress {
 // the route, which means the route works. Only an EgressError marked Broken,
 // meaning the route could not be used at all, takes it out of rotation.
 //
-// A cancelled or timed-out request is ignored for the same reason it is ignored
-// for an account: it reports the client giving up, not a fault.
+// A Broken verdict is trusted outright because the dialers that raise it hold
+// the caller's context and have already excluded a caller who gave up: their
+// own dial and handshake timeouts wrap os.ErrDeadlineExceeded, which a
+// non-dialer isContextFailure check cannot tell apart from a caller's deadline
+// — the misreading that used to leave dead routes in rotation forever. Anything
+// else, including every error raised after the route carried traffic, is not
+// Broken and is ignored, so a cancelled request still costs the route nothing.
 func (p *EgressPool) Report(e *Egress, err error) {
 	if p == nil || e == nil {
-		return
-	}
-	if isContextFailure(err) {
 		return
 	}
 	var egErr *EgressError
@@ -504,9 +530,10 @@ func newEgress(spec string, opts EgressOptions) (*Egress, error) {
 	return e, nil
 }
 
-// newRouteTransport builds the transport for one route. When dial is nil the
-// transport is left on Go's default dialer, which is what the proxy used before
-// routes existed, so the direct path is unchanged.
+// newRouteTransport builds the transport for one route. When dial is nil — the
+// direct route, the machine's own connection — the transport gets a plain dialer
+// carrying the same dial timeout a proxied route's dialer is given, so a
+// black-holed path cannot hang a direct request indefinitely either.
 func newRouteTransport(dial func(context.Context, string, string) (net.Conn, error), opts EgressOptions) *http.Transport {
 	tr := &http.Transport{
 		// The CLI forces HTTP/1.1 against this backend, so match it instead of
@@ -522,6 +549,17 @@ func newRouteTransport(dial func(context.Context, string, string) (net.Conn, err
 		// No Proxy field: DialContext already owns the route, and setting both
 		// would try to tunnel through the proxy twice.
 		tr.DialContext = dial
+	} else {
+		// The Proxy field stays nil on the direct route too, deliberately. This
+		// process is itself a proxy: let the transport discover a proxy from the
+		// environment (HTTP_PROXY, ProxyFromEnvironment) and its own upstream
+		// traffic would loop back through itself. A user who wants their direct
+		// traffic to leave through a proxy configures it as a route instead.
+		dialTimeout := opts.DialTimeout
+		if dialTimeout <= 0 {
+			dialTimeout = 20 * time.Second
+		}
+		tr.DialContext = (&net.Dialer{Timeout: dialTimeout}).DialContext
 	}
 	return tr
 }
@@ -535,7 +573,7 @@ func newRouteTransport(dial func(context.Context, string, string) (net.Conn, err
 func dialSOCKS5(e *Egress, ctx context.Context, proxyAddr, user, pass, target string, timeout time.Duration) (net.Conn, error) {
 	conn, err := dialProxy(ctx, proxyAddr, timeout)
 	if err != nil {
-		return nil, broken(e, "dial proxy "+proxyAddr, err)
+		return nil, brokenCtx(ctx, e, "dial proxy "+proxyAddr, err)
 	}
 	ok := false
 	defer func() {
@@ -548,7 +586,7 @@ func dialSOCKS5(e *Egress, ctx context.Context, proxyAddr, user, pass, target st
 	// deadline is cleared once the tunnel is up, because the generation that
 	// follows legitimately runs for minutes.
 	_ = conn.SetDeadline(time.Now().Add(timeout))
-	if err := socks5Handshake(e, conn, user, pass, target); err != nil {
+	if err := socks5Handshake(ctx, e, conn, user, pass, target); err != nil {
 		return nil, err
 	}
 	_ = conn.SetDeadline(time.Time{})
@@ -556,27 +594,32 @@ func dialSOCKS5(e *Egress, ctx context.Context, proxyAddr, user, pass, target st
 	return conn, nil
 }
 
-func socks5Handshake(e *Egress, conn net.Conn, user, pass, target string) error {
+// socks5Handshake performs the SOCKS5 greeting, authentication and CONNECT. It
+// is dialer-level: every deadline in it is the route's own handshake deadline,
+// so its failures are classified by brokenCtx against the caller's context —
+// a handshake timeout means the route is dead, while a caller that gave up
+// mid-handshake does not cool it.
+func socks5Handshake(ctx context.Context, e *Egress, conn net.Conn, user, pass, target string) error {
 	// Greeting: offer no-auth, and username/password when we have credentials.
 	methods := []byte{0x00}
 	if user != "" {
 		methods = append(methods, 0x02)
 	}
 	if _, err := conn.Write(append([]byte{0x05, byte(len(methods))}, methods...)); err != nil {
-		return broken(e, "socks5 greeting", err)
+		return brokenCtx(ctx, e, "socks5 greeting", err)
 	}
 	var choice [2]byte
 	if _, err := io.ReadFull(conn, choice[:]); err != nil {
-		return broken(e, "socks5 greeting reply", err)
+		return brokenCtx(ctx, e, "socks5 greeting reply", err)
 	}
 	if choice[0] != 0x05 {
-		return broken(e, "socks5 greeting reply", fmt.Errorf("not a SOCKS5 proxy (version %d)", choice[0]))
+		return brokenCtx(ctx, e, "socks5 greeting reply", fmt.Errorf("not a SOCKS5 proxy (version %d)", choice[0]))
 	}
 	switch choice[1] {
 	case 0x00:
 	case 0x02:
 		if user == "" {
-			return broken(e, "socks5 auth", errors.New("proxy requires a username and password"))
+			return brokenCtx(ctx, e, "socks5 auth", errors.New("proxy requires a username and password"))
 		}
 		// RFC 1929: version, then both fields length-prefixed.
 		msg := []byte{0x01, byte(len(user))}
@@ -584,21 +627,21 @@ func socks5Handshake(e *Egress, conn net.Conn, user, pass, target string) error 
 		msg = append(msg, byte(len(pass)))
 		msg = append(msg, pass...)
 		if _, err := conn.Write(msg); err != nil {
-			return broken(e, "socks5 auth", err)
+			return brokenCtx(ctx, e, "socks5 auth", err)
 		}
 		var authReply [2]byte
 		if _, err := io.ReadFull(conn, authReply[:]); err != nil {
-			return broken(e, "socks5 auth reply", err)
+			return brokenCtx(ctx, e, "socks5 auth reply", err)
 		}
 		if authReply[1] != 0x00 {
 			// The route is working and refusing us: confirmed unusable as
 			// configured, so it earns a cooldown.
-			return broken(e, "socks5 auth", errors.New("proxy rejected the username or password"))
+			return brokenCtx(ctx, e, "socks5 auth", errors.New("proxy rejected the username or password"))
 		}
 	case 0xFF:
-		return broken(e, "socks5 auth", errors.New("proxy accepts none of the offered auth methods"))
+		return brokenCtx(ctx, e, "socks5 auth", errors.New("proxy accepts none of the offered auth methods"))
 	default:
-		return broken(e, "socks5 auth", fmt.Errorf("proxy selected unsupported auth method 0x%02x", choice[1]))
+		return brokenCtx(ctx, e, "socks5 auth", fmt.Errorf("proxy selected unsupported auth method 0x%02x", choice[1]))
 	}
 
 	host, portStr, err := net.SplitHostPort(target)
@@ -626,15 +669,15 @@ func socks5Handshake(e *Egress, conn net.Conn, user, pass, target string) error 
 	}
 	req = append(req, byte(port>>8), byte(port))
 	if _, err := conn.Write(req); err != nil {
-		return broken(e, "socks5 connect", err)
+		return brokenCtx(ctx, e, "socks5 connect", err)
 	}
 
 	var reply [4]byte
 	if _, err := io.ReadFull(conn, reply[:]); err != nil {
-		return broken(e, "socks5 connect reply", err)
+		return brokenCtx(ctx, e, "socks5 connect reply", err)
 	}
 	if reply[0] != 0x05 {
-		return broken(e, "socks5 connect reply", fmt.Errorf("not a SOCKS5 reply (version %d)", reply[0]))
+		return brokenCtx(ctx, e, "socks5 connect reply", fmt.Errorf("not a SOCKS5 reply (version %d)", reply[0]))
 	}
 	if reply[1] != 0x00 {
 		return socks5ReplyError(e, reply[1])
@@ -650,14 +693,14 @@ func socks5Handshake(e *Egress, conn net.Conn, user, pass, target string) error 
 	case 0x03:
 		var n [1]byte
 		if _, err := io.ReadFull(conn, n[:]); err != nil {
-			return broken(e, "socks5 connect reply", err)
+			return brokenCtx(ctx, e, "socks5 connect reply", err)
 		}
 		skip = int(n[0])
 	default:
-		return broken(e, "socks5 connect reply", fmt.Errorf("unknown address type 0x%02x", reply[3]))
+		return brokenCtx(ctx, e, "socks5 connect reply", fmt.Errorf("unknown address type 0x%02x", reply[3]))
 	}
 	if _, err := io.CopyN(io.Discard, conn, int64(skip)+2); err != nil {
-		return broken(e, "socks5 connect reply", err)
+		return brokenCtx(ctx, e, "socks5 connect reply", err)
 	}
 	return nil
 }
@@ -698,7 +741,7 @@ func socks5ReplyError(e *Egress, code byte) error {
 func dialHTTPConnect(e *Egress, ctx context.Context, scheme, proxyAddr, user, pass, target string, timeout time.Duration) (net.Conn, error) {
 	conn, err := dialProxy(ctx, proxyAddr, timeout)
 	if err != nil {
-		return nil, broken(e, "dial proxy "+proxyAddr, err)
+		return nil, brokenCtx(ctx, e, "dial proxy "+proxyAddr, err)
 	}
 	ok := false
 	defer func() {
@@ -714,8 +757,10 @@ func dialHTTPConnect(e *Egress, ctx context.Context, scheme, proxyAddr, user, pa
 		defer cancel()
 		if err := tlsConn.HandshakeContext(hsCtx); err != nil {
 			// TLS to the proxy itself failing is the route's fault: either it is
-			// not speaking TLS on this port or something is intercepting it.
-			return nil, broken(e, "tls to proxy", err)
+			// not speaking TLS on this port or something is intercepting it. The
+			// exception is a caller that gave up, which brokenCtx reads off ctx —
+			// hsCtx's own deadline here is the route's, not the caller's.
+			return nil, brokenCtx(ctx, e, "tls to proxy", err)
 		}
 		conn = tlsConn
 	}
@@ -730,7 +775,7 @@ func dialHTTPConnect(e *Egress, ctx context.Context, scheme, proxyAddr, user, pa
 		head += "Proxy-Authorization: Basic " + cred + "\r\n"
 	}
 	if _, err := io.WriteString(conn, head+"\r\n"); err != nil {
-		return nil, broken(e, "write CONNECT", err)
+		return nil, brokenCtx(ctx, e, "write CONNECT", err)
 	}
 
 	// ReadResponse consumes from this reader, so it is kept: it may have read past
@@ -739,7 +784,10 @@ func dialHTTPConnect(e *Egress, ctx context.Context, scheme, proxyAddr, user, pa
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
-		return nil, broken(e, "read CONNECT reply", err)
+		// The wait for the reply runs on the route's own deadline, so a timeout
+		// here is the route black-holing us, not the caller giving up — brokenCtx
+		// splits exactly those two.
+		return nil, brokenCtx(ctx, e, "read CONNECT reply", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
@@ -813,6 +861,27 @@ func RoutesFromFile(path string) ([]string, error) {
 // route its place in the rotation.
 func broken(e *Egress, op string, err error) error {
 	if isContextFailure(err) {
+		return &EgressError{Egress: e, Op: op, Err: err}
+	}
+	return &EgressError{Egress: e, Op: op, Err: err, Broken: true}
+}
+
+// brokenCtx is broken for the dialers, which hold the caller's context and can
+// therefore see something isContextFailure cannot: a deadline the dialer's own
+// timeout raised is delivered as os.ErrDeadlineExceeded, which is exactly what a
+// caller-set deadline looks like once Go wraps it. So the context decides —
+// ctx.Err() non-nil means the caller cancelled or its own deadline fired and the
+// failure says nothing about the route; anything else, including a timeout the
+// dialer's DialTimeout raised against a black-holed exit, is the route failing
+// on its own and earns the cooldown.
+//
+// This is only for the dialer-level sites, which own the tunnel up to the point
+// the backend is reachable. Later failures (TLS through the tunnel, the wait for
+// response headers) keep the blunter broken/isContextFailure reading, because by
+// then the route has already carried traffic and a deadline there is far more
+// likely to be the caller's than the route's.
+func brokenCtx(ctx context.Context, e *Egress, op string, err error) error {
+	if ctx.Err() != nil {
 		return &EgressError{Egress: e, Op: op, Err: err}
 	}
 	return &EgressError{Egress: e, Op: op, Err: err, Broken: true}

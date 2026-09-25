@@ -73,7 +73,9 @@ type banRecord struct {
 
 // OpenStore reads the dashboard state, creating an empty one if the file does not
 // exist yet. A file that exists but cannot be parsed is an error rather than a
-// silent reset: it would otherwise throw away the managed accounts.
+// silent reset: it would otherwise throw away the managed accounts. So is a file
+// written by a newer version of this program — decoding it with fields this
+// version does not know and writing it back out would quietly drop them.
 func OpenStore(path string) (*Store, error) {
 	s := &Store{Path: path, data: storeData{Version: storeVersion, Bans: map[string]*banRecord{}}}
 	if path == "" {
@@ -84,6 +86,13 @@ func OpenStore(path string) (*Store, error) {
 	case err == nil:
 		if err := json.Unmarshal(raw, &s.data); err != nil {
 			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		// Version 0 is a file written before the field existed; anything above the
+		// version this build knows is someone else's future and is refused rather
+		// than half-understood.
+		if s.data.Version > storeVersion {
+			return nil, fmt.Errorf("%s: version %d is newer than this build understands (%d)",
+				path, s.data.Version, storeVersion)
 		}
 		if s.data.Bans == nil {
 			s.data.Bans = map[string]*banRecord{}
@@ -113,12 +122,43 @@ func (s *Store) save() error {
 		}
 	}
 	// Written beside the target and renamed over it, so a crash mid-write cannot
-	// leave a half-written file where the accounts were.
-	tmp := s.Path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
+	// leave a half-written file where the accounts were. The temporary file gets a
+	// unique name rather than a fixed one, so two writers — or a leftover from a
+	// crash — cannot collide, and it carries 0600 like the file it becomes: it
+	// holds the same credentials.
+	f, err := os.CreateTemp(filepath.Dir(s.Path), filepath.Base(s.Path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.Path)
+	tmp := f.Name()
+	// CreateTemp already opens with 0600; set explicitly so the mode is part of
+	// the contract rather than an accident of the standard library.
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	// Flushed to the disk before the rename: a rename that out-races its own data
+	// is the one failure mode a crash can still produce here.
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, s.Path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // SetPassword records a new password hash, replacing any previous one.
@@ -199,11 +239,25 @@ func (s *Store) Proxies() []string {
 	return append([]string(nil), s.data.Proxies...)
 }
 
-// SetProxies replaces the managed route list and writes it out.
+// HasProxies reports whether the store carries a proxies key at all, as opposed
+// to carrying an empty one. The distinction matters for the route listing: an
+// empty stored list is an operator's deliberate "no routes", while an absent key
+// says the store has never managed them and the running pool's own list is worth
+// showing instead.
+func (s *Store) HasProxies() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.data.Proxies != nil
+}
+
+// SetProxies replaces the managed route list and writes it out. An empty list is
+// kept as an empty list rather than collapsed into "no key": clearing the routes
+// is a decision the store should remember distinctly from never having managed
+// them (see HasProxies).
 func (s *Store) SetProxies(specs []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data.Proxies = append([]string(nil), specs...)
+	s.data.Proxies = append(make([]string, 0, len(specs)), specs...)
 	return s.save()
 }
 

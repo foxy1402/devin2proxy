@@ -225,10 +225,12 @@ func (d *Dashboard) handleAccountDelete(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	idx := *body.Index
-	// Take a copy of the token before removing, so the log can name which account
-	// left without keeping it anywhere else.
+	// Resolve the account to a credential and remove by identity rather than by
+	// removing through the index: a concurrent dashboard action can renumber the
+	// pool between the bounds check and the removal, and removing through a
+	// stale index would delete — and then persist — the wrong account.
 	removed := d.cfg.Pool.CredentialAt(idx)
-	if !d.cfg.Pool.Remove(idx) {
+	if removed == nil || !d.cfg.Pool.RemoveCredential(removed) {
 		d.deny(w, r, http.StatusBadRequest, "no such account")
 		return
 	}

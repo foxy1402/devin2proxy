@@ -27,7 +27,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Vet and test before anything is built: the image push below is gated on
+  # this job, so a regression cannot ship straight to the tag compose pulls.
+  # The live tests in the repo are skipped unless their env vars are set, so
+  # plain `go test ./...` is hermetic.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
   build-and-push:
+    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

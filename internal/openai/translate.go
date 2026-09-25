@@ -3,6 +3,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"unicode/utf8"
 
@@ -140,21 +141,24 @@ const DefaultSystemPrompt = "You are a helpful assistant. Answer the user's requ
 // ------------------------------------------------------------------ stop
 
 // ParseStop reads the `stop` field, which OpenAI accepts as either a single
-// string or an array of them.
-func ParseStop(raw json.RawMessage) []string {
+// string or an array of them. A malformed value is an error rather than a
+// silently disabled filter: a client that asked for a stop expects generation
+// to halt there, and answering with no stop at all serves a different request
+// than the one made.
+func ParseStop(raw json.RawMessage) ([]string, error) {
 	if len(raw) == 0 {
-		return nil
+		return nil, nil
 	}
 	var one string
 	if err := json.Unmarshal(raw, &one); err == nil {
 		if one == "" {
-			return nil
+			return nil, nil
 		}
-		return []string{one}
+		return []string{one}, nil
 	}
 	var many []string
 	if err := json.Unmarshal(raw, &many); err != nil {
-		return nil
+		return nil, fmt.Errorf("stop must be a string or an array of strings")
 	}
 	out := many[:0]
 	for _, s := range many {
@@ -162,7 +166,7 @@ func ParseStop(raw json.RawMessage) []string {
 			out = append(out, s)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // StopFilter truncates generated text at the first stop sequence and reports
@@ -215,8 +219,18 @@ func (f *StopFilter) Write(s string) string {
 	if keep > len(f.pending) {
 		keep = len(f.pending)
 	}
-	out := f.pending[:len(f.pending)-keep]
-	f.pending = f.pending[len(f.pending)-keep:]
+	cut := len(f.pending) - keep
+	// Rune-align the cut. A multi-byte rune straddling it would be split between
+	// two emitted fragments, and the SSE path marshals each fragment separately,
+	// so the two invalid halves would each arrive as U+FFFD in the client's
+	// reassembled text. Backing the emit point up to the last rune start only
+	// ever increases the held-back suffix, and stop detection runs on the whole
+	// of pending before this cut is taken, so it is unaffected.
+	for cut > 0 && cut < len(f.pending) && !utf8.RuneStart(f.pending[cut]) {
+		cut--
+	}
+	out := f.pending[:cut]
+	f.pending = f.pending[cut:]
 	return out
 }
 
@@ -358,10 +372,18 @@ func BuildDevinRequest(apiKey string, req *ChatRequest, model string, opts Optio
 			prompts = append(prompts, p)
 
 		case "tool", "function":
+			// A tool result with no text would vanish from the wire: an empty
+			// prompt field is dropped, and the model would then see the tool
+			// call it made and no answer to it. The user branch guards the same
+			// way, with a placeholder rather than a dropped turn.
+			text := m.Content.Text
+			if text == "" {
+				text = "(empty tool result)"
+			}
 			prompts = append(prompts, devin.ChatMessagePrompt{
 				MessageID:  devin.MustUUID(),
 				Source:     devin.SourceTool,
-				Prompt:     m.Content.Text,
+				Prompt:     text,
 				ToolCallID: m.ToolCallID,
 			})
 
@@ -419,8 +441,38 @@ func BuildDevinRequest(apiKey string, req *ChatRequest, model string, opts Optio
 		return nil, fmt.Errorf("tool_choice %s is not supported: the backend decides on its own whether to call a tool", toolChoice)
 	}
 
+	// The backend has no equivalent for response_format or the sampling knobs
+	// below. Refusing them would break clients that send them on every request
+	// — the same reasoning that keeps n=1 servable — so they are accepted and
+	// reported here instead, once and in one line, so a request served loosely
+	// is visible in the log rather than discoverable from the model's output.
+	var unenforced []string
+	var responseFormat struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(req.ResponseFormat, &responseFormat); err == nil {
+		switch responseFormat.Type {
+		case "json_object", "json_schema":
+			unenforced = append(unenforced, "response_format "+responseFormat.Type)
+		}
+	}
+	if req.FrequencyPenalty != nil && *req.FrequencyPenalty != 0 {
+		unenforced = append(unenforced, "frequency_penalty")
+	}
+	if req.PresencePenalty != nil && *req.PresencePenalty != 0 {
+		unenforced = append(unenforced, "presence_penalty")
+	}
+	if req.Seed != nil && *req.Seed != 0 {
+		unenforced = append(unenforced, "seed")
+	}
+	if len(unenforced) > 0 {
+		log.Printf("chat request asked for %s: accepted, but the backend does not enforce any of them", strings.Join(unenforced, ", "))
+	}
+
+	// max_completion_tokens is the modern name, and when a client sends both it
+	// is the one it meant; the legacy field is the fallback, not the winner.
 	maxTokens := uint64(DefaultMaxTokens)
-	if v := firstInt(req.MaxTokens, req.MaxCompletionTokens); v != nil {
+	if v := firstInt(req.MaxCompletionTokens, req.MaxTokens); v != nil {
 		// A client that asks for zero or a negative budget is confused, and
 		// quietly substituting the default would answer a different question
 		// than the one asked. OpenAI itself rejects max_tokens < 1.

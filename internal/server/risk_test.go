@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -200,5 +201,99 @@ func TestAToolCallThatStopsNormallyFinishesAsToolCalls(t *testing.T) {
 	}
 	if len(body.Choices[0].Message.ToolCalls) != 1 {
 		t.Fatalf("tool_calls = %+v, want the call the backend delivered", body.Choices[0].Message.ToolCalls)
+	}
+}
+
+// sseChunk is the loose shape both streaming endpoints end with: one frame with
+// no choices, carrying the usage line.
+type sseChunk struct {
+	Choices []json.RawMessage `json:"choices"`
+	Usage   *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
+// lastSSEChunk decodes the last JSON data frame of a streamed response.
+func lastSSEChunk(t *testing.T, body string) sseChunk {
+	t.Helper()
+	var last sseChunk
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		if err := json.Unmarshal([]byte(line), &last); err != nil {
+			t.Fatalf("decode %q: %v", line, err)
+		}
+	}
+	return last
+}
+
+func TestAnIncludeUsageFinalChunkAlwaysCarriesUsage(t *testing.T) {
+	// The backend sent no stats at all here, but the client explicitly asked
+	// for the usage line by setting include_usage: omitting the field would
+	// hand a client that parses `usage` nothing, so an explicit zero is sent.
+	srv, _ := frameServer(t, textFrame("hello", devin.StopNormal, true), endFrame())
+	rec := do(srv, http.MethodPost, "/v1/chat/completions", "sk-devin-test",
+		`{"model":"swe-1.6","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d (body %s)", rec.Code, rec.Body)
+	}
+	last := lastSSEChunk(t, rec.Body.String())
+	if last.Usage == nil {
+		t.Fatalf("no chunk carried usage despite include_usage: %s", rec.Body)
+	}
+	if len(last.Choices) != 0 {
+		t.Errorf("the usage chunk carries %d choices, want none", len(last.Choices))
+	}
+	if last.Usage.PromptTokens != 0 || last.Usage.CompletionTokens != 0 || last.Usage.TotalTokens != 0 {
+		t.Errorf("usage = %+v, want explicit zeros", last.Usage)
+	}
+
+	// The legacy stream behaves the same way.
+	srv, _ = frameServer(t, textFrame("hello", devin.StopNormal, true), endFrame())
+	rec = do(srv, http.MethodPost, "/v1/completions", "sk-devin-test",
+		`{"model":"swe-1.6","stream":true,"stream_options":{"include_usage":true},"prompt":"hi"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy status %d (body %s)", rec.Code, rec.Body)
+	}
+	if last := lastSSEChunk(t, rec.Body.String()); last.Usage == nil {
+		t.Errorf("the legacy stream omitted usage despite include_usage: %s", rec.Body)
+	}
+}
+
+func TestAStreamedToolCallWithoutAnIDGetsThePlaceholder(t *testing.T) {
+	// The non-streaming path synthesizes call_N ids in Calls(); the streamed
+	// opening delta must carry the same placeholder, or a client cannot
+	// correlate the fragments with the call it will execute.
+	srv, _ := frameServer(t,
+		toolCallFrame("", "get_weather", `{"city":"Paris"}`),
+		textFrame("", devin.StopNormal, true),
+		endFrame())
+	rec := do(srv, http.MethodPost, "/v1/chat/completions", "sk-devin-test",
+		`{"model":"swe-1.6","stream":true,"messages":[{"role":"user","content":"weather in Paris"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d (body %s)", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"id":"call_0"`) {
+		t.Errorf("the streamed tool call never carried the call_0 placeholder: %s", rec.Body)
+	}
+}
+
+func TestModelFallbackNotesAreCapped(t *testing.T) {
+	// A client that invents a different model name on every request used to
+	// grow the dedup set without bound; recording stops at the cap and the
+	// worst case is one repeated log line.
+	srv, _ := frameServer(t, textFrame("ok", devin.StopNormal, true), endFrame())
+	for i := 0; i < maxModelFallbackNotes+25; i++ {
+		srv.noteModelFallback("invented-"+strconv.Itoa(i), "swe-1.6")
+	}
+	srv.fallbackMu.Lock()
+	n := len(srv.fallbackSeen)
+	srv.fallbackMu.Unlock()
+	if n != maxModelFallbackNotes {
+		t.Fatalf("the fallback set holds %d names, want the cap %d", n, maxModelFallbackNotes)
 	}
 }

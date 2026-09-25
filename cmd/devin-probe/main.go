@@ -292,15 +292,25 @@ func writeConnectEndStream(w http.ResponseWriter, code, msg string) {
 
 func writeCapture(name, content string) {
 	path := filepath.Join(*outDir, name)
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	// 0600, not the usual 0644: the raw hex in a capture carries the full
+	// session token even though the decoded sections above it are masked, so
+	// the file itself is a secret on a shared machine.
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		log.Printf("write %s: %v", path, err)
 	}
 }
 
+// headerBlock renders headers for the capture files with the same masking the
+// console log applies. The raw body hex is kept verbatim — replay needs it —
+// which is why the capture files are still written 0600.
 func headerBlock(h http.Header) string {
 	var sb strings.Builder
 	for _, k := range sortedKeys(h) {
-		sb.WriteString(k + ": " + strings.Join(h.Values(k), ", ") + "\n")
+		v := strings.Join(h.Values(k), ", ")
+		if sensitiveHeaders[strings.ToLower(k)] {
+			v = redact(v)
+		}
+		sb.WriteString(k + ": " + v + "\n")
 	}
 	return sb.String()
 }

@@ -63,12 +63,16 @@ type catalogueCache struct {
 // older than the TTL, or when the page asks for a refresh.
 func (d *Dashboard) handleModels(w http.ResponseWriter, r *http.Request) {
 	models, fetched, account, fail := d.catalogue.snapshot()
-	age := time.Since(fetched)
-	if refresh := r.URL.Query().Get("refresh") != ""; refresh || fetched.IsZero() || age > catalogueTTL {
+	refresh := r.URL.Query().Get("refresh") != ""
+	if refresh || fetched.IsZero() || time.Since(fetched) > catalogueTTL {
 		ctx, cancel := context.WithTimeout(r.Context(), catalogueFetchTimeout)
 		defer cancel()
-		models, fetched, account, fail = d.fetchCatalogue(ctx, refresh || fetched.IsZero())
+		models, fetched, account, fail = d.fetchCatalogue(ctx, refresh)
 	}
+	// Recomputed after the fetch branch: fetched is reassigned there, and a
+	// catalogue that was just read must not be reported with the age of the one
+	// it replaced.
+	age := time.Since(fetched)
 
 	served := d.servedModels(models)
 	available := make([]devin.ModelConfig, 0, len(models))
@@ -259,8 +263,10 @@ func (c *catalogueCache) snapshot() ([]devin.ModelConfig, time.Time, string, err
 }
 
 // fetchCatalogue reads the catalogue, keeping the previous one if this attempt
-// fails. before is the time the caller checked the cache at, so two callers that
-// arrive together do not both fetch: the second finds the cache already newer.
+// fails. force skips the TTL recheck for a refresh the page asked for. It is not
+// set for a cold cache: a zero fetched time fails the recheck on its own, so two
+// page loads that arrive together are serialised by the lock and the second finds
+// the first's catalogue already inside the TTL instead of fetching again.
 func (d *Dashboard) fetchCatalogue(ctx context.Context, force bool) ([]devin.ModelConfig, time.Time, string, error) {
 	d.catalogue.mu.Lock()
 	defer d.catalogue.mu.Unlock()

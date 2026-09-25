@@ -1,6 +1,6 @@
 {
   "addr": "127.0.0.1:8788",
-  "api_key": "sk-devin-<generated on first run; leave empty to regenerate>",
+  "api_key": "",
   "model": "swe-1-6-slow",
   "models": ["swe-1-6-slow", "swe-1.6", "swe"],
   "allow_origins": "*",
@@ -9,14 +9,14 @@
   "min_max_tokens": 8192,
   "max_tool_desc_bytes": 512,
   "tokens": [],
-  "tokens_file": "<optional: one devin-session-token$... per line, rotated one account per request>",
+  "tokens_file": "",
   "proxies": [],
-  "proxies_file": "<optional: one proxy URL per line, rotated one route per request; socks5://, socks5h://, http://, https://, or direct>",
+  "proxies_file": "",
   "quota_cooldown": true,
   "dashboard": true,
-  "dashboard_password": "<optional: at least 8 characters; leave empty and one is generated and printed once, with only its hash stored>",
+  "dashboard_password": "",
   "dashboard_allow_remote": false,
-  "devin_cli": "<optional: path to devin.exe; its path is shown in the terminal command the dashboard offers, and the sign-out endpoint runs it. The sign-in itself is done in-process and does not need it>",
-  "dashboard_webapp_host": "<optional: where the dashboard's sign-in page lives, for a deployment other than app.devin.ai; must be the host serving /auth/cli/continue>",
-  "dashboard_echo_url": "<optional: an endpoint answering with the caller's address as plain text, fetched through a route when it is tested; \"-\" skips it>"
+  "devin_cli": "",
+  "dashboard_webapp_host": "",
+  "dashboard_echo_url": ""
 }

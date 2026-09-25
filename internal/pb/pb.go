@@ -41,11 +41,11 @@ func (w *Writer) varint(v uint64) {
 	w.buf = append(w.buf, byte(v))
 }
 
-func (w *Writer) Tag(field, wire int) { w.varint(uint64(field)<<3 | uint64(wire)) }
+func (w *Writer) tag(field, wire int) { w.varint(uint64(field)<<3 | uint64(wire)) }
 
 // Varint writes an explicit varint field, including zero values.
 func (w *Writer) Varint(field int, v uint64) {
-	w.Tag(field, WireVarint)
+	w.tag(field, WireVarint)
 	w.varint(v)
 }
 
@@ -82,7 +82,7 @@ func (w *Writer) Double(field int, v float64) {
 	if v == 0 {
 		return
 	}
-	w.Tag(field, WireFixed64)
+	w.tag(field, WireFixed64)
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], math.Float64bits(v))
 	w.buf = append(w.buf, b[:]...)
@@ -93,7 +93,7 @@ func (w *Writer) Double(field int, v float64) {
 // building a fixture, say — needs it; the reader has had the matching Fixed32 all
 // along.
 func (w *Writer) Float32(field int, v float32) {
-	w.Tag(field, WireFixed32)
+	w.tag(field, WireFixed32)
 	var b [4]byte
 	binary.LittleEndian.PutUint32(b[:], math.Float32bits(v))
 	w.buf = append(w.buf, b[:]...)
@@ -110,7 +110,7 @@ func (w *Writer) String(field int, s string) {
 // RawBytes always writes the field, even when empty. Use it for sub-messages,
 // where an empty message is still meaningfully present.
 func (w *Writer) RawBytes(field int, b []byte) {
-	w.Tag(field, WireBytes)
+	w.tag(field, WireBytes)
 	w.varint(uint64(len(b)))
 	w.buf = append(w.buf, b...)
 }
@@ -153,6 +153,10 @@ func (r *Reader) fail(err error) {
 	}
 }
 
+// varint reads a base-128 varint. Ten bytes is the spec's ceiling, and the
+// tenth carries only bit 63: a final byte of 0x02 would shift its high bit out
+// of the uint64 and wrap into a wrong-but-clean value, so anything above 0x01
+// there is rejected as malformed rather than decoded to garbage.
 func (r *Reader) varint() uint64 {
 	var v uint64
 	var shift uint
@@ -163,6 +167,10 @@ func (r *Reader) varint() uint64 {
 		}
 		b := r.buf[r.i]
 		r.i++
+		if shift == 63 && b&0xfe != 0 {
+			r.fail(errors.New("pb: varint overflows 64 bits"))
+			return 0
+		}
 		v |= uint64(b&0x7f) << shift
 		if b < 0x80 {
 			return v
@@ -221,20 +229,20 @@ func (r *Reader) Fixed32() uint32 {
 	return v
 }
 
-// Float32 reads a fixed32 interpreted as a float.
-func (r *Reader) Float32() float32 { return math.Float32frombits(r.Fixed32()) }
-
 func (r *Reader) Bytes() []byte {
-	n := int(r.varint())
+	n := r.varint()
 	if r.err != nil {
 		return nil
 	}
-	if n < 0 || r.i+n > len(r.buf) {
+	// Compare in uint64 before converting to int: on a 32-bit build a huge
+	// length would truncate into a small valid-looking one and hand back a
+	// slice the sender never sent.
+	if n > uint64(len(r.buf)-r.i) {
 		r.fail(fmt.Errorf("pb: truncated length-delimited field (want %d, have %d)", n, len(r.buf)-r.i))
 		return nil
 	}
-	b := r.buf[r.i : r.i+n]
-	r.i += n
+	b := r.buf[r.i : r.i+int(n)]
+	r.i += int(n)
 	return b
 }
 
@@ -247,7 +255,19 @@ func (r *Reader) Skip(wire int) {
 	case WireFixed64:
 		r.i += 8
 	case WireBytes:
-		r.i += int(r.varint())
+		n := r.varint()
+		if r.err != nil {
+			return
+		}
+		// Compare in uint64 before converting to int: a length of 2^63
+		// becomes a negative int, and a negative cursor slips past the
+		// bounds check below, so the next Field() would index before the
+		// start of the buffer and panic.
+		if n > uint64(len(r.buf)-r.i) {
+			r.fail(errors.New("pb: field runs past end of message"))
+			return
+		}
+		r.i += int(n)
 	case WireFixed32:
 		r.i += 4
 	default:

@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"devin2proxy/internal/devin"
 	"devin2proxy/internal/eventlog"
@@ -58,8 +57,10 @@ func TestStartingASignInReturnsAURLWithoutTheVerifier(t *testing.T) {
 		t.Errorf("the sign-in URL names a redirect URI, which the site refuses: %s", started.URL)
 	}
 	// The state is in the URL; the verifier is not, and must not be.
-	if d.logins.len(time.Now()) != 1 {
-		t.Fatalf("pending sign-ins = %d, want 1", d.logins.len(time.Now()))
+	// Pending sign-ins are counted on the map itself: the flow struct has no
+	// counter of its own for the tests to lean on.
+	if len(d.logins.flows) != 1 {
+		t.Fatalf("pending sign-ins = %d, want 1", len(d.logins.flows))
 	}
 	for _, flow := range d.logins.flows {
 		if flow.verifier == "" {
@@ -128,8 +129,8 @@ func TestASignInIsConsumedByItsFirstAttempt(t *testing.T) {
 	if first.Code == http.StatusOK {
 		t.Fatalf("a made-up code was accepted: %s", first.Body)
 	}
-	if d.logins.len(time.Now()) != 0 {
-		t.Errorf("pending sign-ins = %d after an attempt, want 0", d.logins.len(time.Now()))
+	if len(d.logins.flows) != 0 {
+		t.Errorf("pending sign-ins = %d after an attempt, want 0", len(d.logins.flows))
 	}
 	second := post(t, d, "/dashboard/api/accounts/oauth/finish",
 		map[string]string{"state": started.State, "code": "not-a-real-code"}, cookie)

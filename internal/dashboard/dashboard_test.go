@@ -8,7 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -231,6 +234,61 @@ func TestSessionEpochInvalidatesEverySession(t *testing.T) {
 	}
 	if d.validSession(cookie.Value, time.Now()) {
 		t.Fatal("a session issued before the epoch bump is still valid")
+	}
+}
+
+// Logging out must read as a success even when persisting the epoch bump fails:
+// BumpSessionEpoch has already invalidated every session in memory, so a 500 —
+// with the cookie left in place — would report a sign-out that happened as one
+// that did not.
+func TestLogoutSucceedsEvenWhenTheSaveFails(t *testing.T) {
+	d := New(Options{
+		Pool:   devin.NewPool(nil, ""),
+		Store:  lockedStore(t, filepath.Join(t.TempDir(), "dashboard.json")),
+		Events: eventlog.New(64),
+	})
+	cookie := sessionCookieFrom(t, post(t, d, "/dashboard/api/login", map[string]string{"password": "correct-horse-battery"}))
+
+	// Break the disk under the store: the state file becomes a directory, so the
+	// rename the save ends with cannot land.
+	path := d.cfg.Store.Path
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove the state file: %v", err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatalf("block the state path: %v", err)
+	}
+
+	rec := post(t, d, "/dashboard/api/logout", nil, cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("logout with a failed save: status %d, want 200 (body %s)", rec.Code, rec.Body)
+	}
+	var body struct {
+		Authenticated bool   `json:"authenticated"`
+		Warning       string `json:"warning"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if body.Authenticated {
+		t.Error("the logout response claims the client is still signed in")
+	}
+	if body.Warning == "" {
+		t.Error("a save that failed was not reported to the page")
+	}
+	// The cookie is cleared whether or not the save worked.
+	cleared := false
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == sessionCookie && c.Value == "" && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Error("the session cookie was not cleared")
+	}
+	// The epoch moved, so the session is dead regardless of the disk.
+	if d.validSession(cookie.Value, time.Now()) {
+		t.Error("the session survived a logout whose save failed")
 	}
 }
 
@@ -509,6 +567,40 @@ func TestTooManyRoutesIsRefused(t *testing.T) {
 	}
 }
 
+// Once the store manages the routes, its list is the one shown even when it is
+// empty — an operator's deliberate "no routes". The running pool's own list may
+// only stand in while the store has never managed routes at all, because the
+// pool's specs are credential-stripped and a save would write the mask back as
+// if it were the password.
+func TestProxySpecsPrefersTheStoreOnceItManagesRoutes(t *testing.T) {
+	d := testDashboard(t)
+	pool, err := devin.NewEgressPool([]string{"socks5://alice:pw@proxy.example:1080"}, devin.EgressOptions{})
+	if err != nil {
+		t.Fatalf("NewEgressPool: %v", err)
+	}
+	d.cfg.Client.SetEgress(pool)
+
+	// No proxies key in the store: the running pool's list stands in.
+	if d.cfg.Store.HasProxies() {
+		t.Fatal("a fresh store claims to manage routes")
+	}
+	if specs := d.proxySpecs(); len(specs) != 1 || specs[0] != pool.Specs()[0] {
+		t.Fatalf("proxySpecs with no stored key = %v, want the pool's own list", specs)
+	}
+
+	// The store gains the key, empty: that is "no routes", and the pool must not
+	// leak back in over it.
+	if err := d.cfg.Store.SetProxies(nil); err != nil {
+		t.Fatalf("SetProxies: %v", err)
+	}
+	if !d.cfg.Store.HasProxies() {
+		t.Fatal("clearing the routes did not leave the store managing them")
+	}
+	if specs := d.proxySpecs(); len(specs) != 0 {
+		t.Fatalf("proxySpecs with an empty stored list = %v, want empty", specs)
+	}
+}
+
 func TestLogsRecentIsBoundedAndOrdered(t *testing.T) {
 	d := testDashboard(t)
 	rec := post(t, d, "/dashboard/api/login", map[string]string{"password": "correct-horse-battery"})
@@ -749,6 +841,69 @@ func TestStoreWithNoPathStaysInMemory(t *testing.T) {
 	}
 }
 
+// A state file written by a newer build is refused, on the same terms as one that
+// cannot be parsed: decoding it with fields this build has never heard of and
+// writing it back out would quietly drop them. A versionless file — written
+// before the field existed — stays readable.
+func TestAStoreFromANewerVersionIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dashboard.json")
+	future := `{"version":` + strconv.Itoa(storeVersion+1) + `,"accounts":["devin-session-token$x"]}`
+	if err := os.WriteFile(path, []byte(future), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := OpenStore(path); err == nil {
+		t.Fatal("a state file from a newer version was accepted")
+	}
+
+	// Version 0 predates the field and is still this store's own past.
+	if err := os.WriteFile(path, []byte(`{"accounts":["devin-session-token$x"]}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("a versionless file was refused: %v", err)
+	}
+	if got := s.Accounts(); len(got) != 1 || got[0] != "devin-session-token$x" {
+		t.Fatalf("accounts from a versionless file = %v", got)
+	}
+}
+
+// The save goes through a uniquely named temporary file in the target directory
+// and is flushed before the rename. What is observable here: the state lands, the
+// file is 0600 where the platform honours it, and no temporary is left behind.
+func TestSaveLandsAt0600AndLeavesNoTemporaryBehind(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dashboard.json")
+	store := mustStore(t, path)
+	if err := store.SetAccounts([]string{"devin-session-token$x"}); err != nil {
+		t.Fatalf("SetAccounts: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat the state file: %v", err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Errorf("the state file is %o, want 0600", info.Mode().Perm())
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read the directory: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name() != "dashboard.json" {
+			t.Errorf("the save left %s behind; a temporary file must not outlive the rename", e.Name())
+		}
+	}
+	// And the file that landed is readable by this build.
+	reopened, err := OpenStore(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if got := reopened.Accounts(); len(got) != 1 {
+		t.Fatalf("accounts after reopen = %v", got)
+	}
+}
+
 func TestGeneratePasswordIsUsableAndStored(t *testing.T) {
 	store, err := OpenStore("")
 	if err != nil {
@@ -809,6 +964,42 @@ func TestTheUIRouteServesThePageWithoutASession(t *testing.T) {
 	redir := get(t, d, "/dashboard")
 	if redir.Code != http.StatusFound {
 		t.Errorf("GET /dashboard: status %d, want 302", redir.Code)
+	}
+}
+
+// The page keeps a full-access session token in sessionStorage, so its response
+// has to carry a content policy that gives that token no way out: default-deny,
+// with only the one inline script and stylesheet the page actually uses allowed,
+// its own-origin fetches permitted, and every other source — images, frames,
+// other hosts — refused.
+func TestTheUIResponseCarriesADefaultDenyContentPolicy(t *testing.T) {
+	d := testDashboard(t)
+	rec := get(t, d, "/dashboard/")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /dashboard/: status %d", rec.Code)
+	}
+	csp := rec.Header().Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("the dashboard page carries no Content-Security-Policy")
+	}
+	for _, want := range []string{
+		"default-src 'none'",
+		"script-src 'unsafe-inline'", // the page's one inline script
+		"style-src 'unsafe-inline'",  // its one inline stylesheet
+		"connect-src 'self'",         // the API it fetches
+		"frame-ancestors 'none'",
+		"base-uri 'none'",
+	} {
+		if !strings.Contains(csp, want) {
+			t.Errorf("Content-Security-Policy = %q, missing %q", csp, want)
+		}
+	}
+	// The policy must not have replaced the two headers already stated.
+	if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Error("X-Content-Type-Options is not nosniff")
+	}
+	if rec.Header().Get("Referrer-Policy") != "no-referrer" {
+		t.Error("Referrer-Policy is not no-referrer")
 	}
 }
 
@@ -1142,6 +1333,72 @@ func TestModelsEndpointReportsTheCatalogue(t *testing.T) {
 	}
 	if asked != 2 {
 		t.Errorf("the backend was asked %d times, want 2 after a refresh", asked)
+	}
+}
+
+// Two page loads that arrive together on a cold cache must not both ask the
+// backend: the cache lock serialises them, and the second finds the first's
+// catalogue already inside the TTL. And a catalogue read a moment ago must be
+// reported as fresh, not with the age of the nothing it replaced.
+func TestModelsColdStartFetchesOnceAndReportsAFreshAge(t *testing.T) {
+	var mu sync.Mutex
+	asked := 0
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		asked++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/proto")
+		w.Write(encodeTestCatalogueForDashboard())
+	}))
+	defer stub.Close()
+
+	d := New(Options{
+		Pool:   devin.NewPool([]string{"devin-session-token$aaaaaa"}, stub.URL),
+		Store:  lockedStore(t, filepath.Join(t.TempDir(), "dashboard.json")),
+		Events: eventlog.New(64),
+		Client: devin.NewClient(devin.Options{}),
+		Info:   Info{Model: "swe-1-6-slow", Models: []string{"swe-1-6-slow"}},
+	})
+	cookie := sessionCookieFrom(t, post(t, d, "/dashboard/api/login", map[string]string{"password": "correct-horse-battery"}))
+
+	const loads = 2
+	start := make(chan struct{})
+	recs := make([]*httptest.ResponseRecorder, loads)
+	var wg sync.WaitGroup
+	for i := 0; i < loads; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req := httptest.NewRequest(http.MethodGet, "/dashboard/api/models", nil)
+			req.RemoteAddr = "127.0.0.1:54321"
+			req.AddCookie(cookie)
+			rec := httptest.NewRecorder()
+			d.ServeHTTP(rec, req)
+			recs[i] = rec
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	mu.Lock()
+	count := asked
+	mu.Unlock()
+	if count != 1 {
+		t.Errorf("the backend was asked %d times for one cold cache, want 1: two loads arriving together must not both fetch", count)
+	}
+	var body struct {
+		AgeSeconds int    `json:"age_seconds"`
+		Fetched    string `json:"fetched"`
+	}
+	if err := json.Unmarshal(recs[0].Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v (%s)", err, recs[0].Body)
+	}
+	if body.Fetched == "" {
+		t.Fatal("a successful read reported no fetch time")
+	}
+	if body.AgeSeconds > 60 {
+		t.Errorf("age_seconds = %d for a catalogue fetched during this test; the age was not recomputed after the fetch", body.AgeSeconds)
 	}
 }
 
@@ -1512,6 +1769,33 @@ func TestARequestBodyThatIsTooLargeOrUnknownIsRefused(t *testing.T) {
 	}
 	if d.cfg.Pool.Len() != 2 {
 		t.Error("a malformed body changed the pool")
+	}
+}
+
+// A JSON decoder stops at the end of the first document; everything after it used
+// to be accepted and quietly ignored. A body that carries a second document — or
+// any trailing bytes — is refused rather than acted on as if it were one.
+func TestARequestBodyWithTrailingDataIsRefused(t *testing.T) {
+	d := testDashboard(t)
+	cookie := sessionCookieFrom(t, post(t, d, "/dashboard/api/login", map[string]string{"password": "correct-horse-battery"}))
+
+	for _, body := range []string{
+		`{"index":0}{"index":1}`,
+		`{"index":0} trailing garbage`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/dashboard/api/accounts/delete",
+			strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		d.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("a body with trailing data (%q): status %d, want 400 (body %s)", body, rec.Code, rec.Body)
+		}
+	}
+	if d.cfg.Pool.Len() != 2 {
+		t.Error("a body with trailing data changed the pool")
 	}
 }
 

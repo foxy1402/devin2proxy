@@ -24,10 +24,6 @@ func newRotationCursor(n int) rotationCursor {
 	return rotationCursor{cooling: make([]time.Time, n)}
 }
 
-// Len reports how many slots the cursor has. The count changes when the pool
-// gains or loses an account, both of which keep the walk position meaningful.
-func (c *rotationCursor) Len() int { return len(c.cooling) }
-
 // appendSlot grows the cursor by one warm slot, so the pool can take on another
 // account without losing the cooldowns of the ones it already has. Call it with
 // the lock held.
@@ -158,13 +154,4 @@ func (c *rotationCursor) extendCooling(idx int, now, until time.Time) bool {
 	}
 	c.cooling[idx] = until
 	return true
-}
-
-// coolingUntil reports the deadline a slot is cooling until, and whether it is
-// cooling at all. Call it with the lock held.
-func (c *rotationCursor) coolingUntil(idx int, now time.Time) (time.Time, bool) {
-	if idx < 0 || idx >= len(c.cooling) {
-		return time.Time{}, false
-	}
-	return c.cooling[idx], now.Before(c.cooling[idx])
 }

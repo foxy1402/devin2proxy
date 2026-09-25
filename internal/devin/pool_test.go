@@ -326,6 +326,29 @@ func TestNewPoolAppliesAPIServerURL(t *testing.T) {
 	if got := poolOf(1).Next().APIServerURL; got != defaultAPIServerURL {
 		t.Fatalf("APIServerURL = %q, want %q", got, defaultAPIServerURL)
 	}
+	// A trailing slash is trimmed the way LoadCredentials trims the env override,
+	// so a pooled request does not double the slash against the base URL.
+	p = NewPool([]string{tokenAt(0)}, "http://127.0.0.1:8787/")
+	if got := p.Next().APIServerURL; got != "http://127.0.0.1:8787" {
+		t.Fatalf("APIServerURL = %q, want the trailing slash trimmed", got)
+	}
+}
+
+func TestNewPoolDeduplicatesRepeatedTokens(t *testing.T) {
+	// A tokens file edited by hand can easily carry the same line twice. Two
+	// slots for one account would rotate to it twice as often, cool it twice on
+	// one refusal and double-count it everywhere, so a repeat must be one slot.
+	p := NewPool([]string{tokenAt(0), tokenAt(1), tokenAt(0), "  " + tokenAt(1) + "  "}, "")
+	if got := p.Len(); got != 2 {
+		t.Fatalf("Len = %d, want 2 for a list holding two distinct tokens", got)
+	}
+	if p.entries[0].poolIndex != 0 || p.entries[1].poolIndex != 1 {
+		t.Fatalf("poolIndexes = %d/%d, want 0/1", p.entries[0].poolIndex, p.entries[1].poolIndex)
+	}
+	// Add still refuses a token the pool already holds, deduplicated or not.
+	if got := p.Add(tokenAt(1)); got != -1 {
+		t.Fatalf("Add of a held token = %d, want -1", got)
+	}
 }
 
 func TestPoolSurvivesARetryStormOfCancels(t *testing.T) {
@@ -356,6 +379,61 @@ func TestPoolSurvivesARetryStormOfCancels(t *testing.T) {
 		if until := coolingUntilFor(p, i); !until.IsZero() {
 			t.Fatalf("account %d was benched until %s by client-side interruptions", i, until)
 		}
+	}
+}
+
+func TestRemoveCredentialResolvesTheAccountNotTheIndex(t *testing.T) {
+	// The credential-keyed removal exists so a caller that cannot trust a stale
+	// index — the dashboard reading a States snapshot, say — can still remove
+	// exactly the account it means to. The identity check is the one Report and
+	// ClearCooldown make.
+	p := poolOf(3)
+
+	// The account itself is removed, wherever it sits.
+	if !p.RemoveCredential(p.entries[1]) {
+		t.Fatal("RemoveCredential of a held account returned false")
+	}
+	if got := p.Len(); got != 2 {
+		t.Fatalf("Len = %d after removing the middle account, want 2", got)
+	}
+	if got := p.Next().APIKey; got == tokenAt(1) {
+		t.Fatal("the removed account is still in rotation")
+	}
+	// The survivors are renumbered, as Remove does.
+	if p.entries[0].poolIndex != 0 || p.entries[1].poolIndex != 1 {
+		t.Fatalf("survivor poolIndexes = %d/%d, want 0/1", p.entries[0].poolIndex, p.entries[1].poolIndex)
+	}
+
+	// A credential the pool does not hold removes nothing: a foreign one, one
+	// already removed, and nil.
+	foreign := &Credentials{APIKey: tokenAt(9), poolIndex: 0}
+	if p.RemoveCredential(foreign) {
+		t.Fatal("a foreign credential was removed")
+	}
+	removed := p.entries[0]
+	if !p.RemoveCredential(removed) {
+		t.Fatal("setup: RemoveCredential of a held account failed")
+	}
+	if p.RemoveCredential(removed) {
+		t.Fatal("an already-removed credential was removed again")
+	}
+	if p.RemoveCredential(nil) {
+		t.Fatal("a nil credential was removed")
+	}
+	if got := p.Len(); got != 1 {
+		t.Fatalf("Len = %d at the end, want 1", got)
+	}
+
+	// Per-slot quota state keeps its len invariant: the removed slots' quota
+	// entries went with them.
+	if len(p.busy) != p.Len() || len(p.quotaCoolUntil) != p.Len() {
+		t.Fatalf("per-slot slices = %d busy / %d quota for %d entries",
+			len(p.busy), len(p.quotaCoolUntil), p.Len())
+	}
+
+	var nilPool *Pool
+	if nilPool.RemoveCredential(nil) {
+		t.Fatal("nil pool removed anything")
 	}
 }
 

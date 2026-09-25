@@ -265,10 +265,14 @@ type Server struct {
 	client *devin.Client
 	mux    *http.ServeMux
 	opts   openai.Options
-	// modelFallbacks dedupes the "model not advertised" notice. An IDE
-	// configured for, say, "gpt-4" would otherwise log the same line on every
-	// autocomplete request and bury anything that matters.
-	modelFallbacks sync.Map
+	// fallbackMu guards fallbackSeen, the dedup set behind the "model not
+	// advertised" notice. An IDE configured for, say, "gpt-4" would otherwise
+	// log the same line on every autocomplete request and bury anything that
+	// matters. The set is capped (maxModelFallbackNotes): a client that invents
+	// a different model name on every request would otherwise grow it without
+	// bound, and exceeding the cap costs one repeated log line.
+	fallbackMu   sync.Mutex
+	fallbackSeen map[string]bool
 	// captureWarn reports a broken capture directory once; request capture is
 	// a debug aid and must not turn into a log flood.
 	captureWarn sync.Once
@@ -358,7 +362,24 @@ func bearerToken(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("x-api-key"))
 }
 
+// methodIsGetOrHead answers whether the request may proceed on a read-only
+// route, and otherwise writes the 405 with the Allow header that makes the
+// rejection machine-readable — a client that only sees "405" has to guess what
+// would have worked.
+func methodIsGetOrHead(w http.ResponseWriter, r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		return true
+	}
+	w.Header().Set("Allow", "GET, HEAD")
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
+	return false
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if !methodIsGetOrHead(w, r) {
+		return
+	}
 	status := map[string]any{"status": "ok"}
 	switch {
 	case s.cfg.Creds.Len() > 0:
@@ -392,6 +413,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	if !methodIsGetOrHead(w, r) {
+		return
+	}
 	now := time.Now().Unix()
 	list := openai.ModelList{Object: "list"}
 	for _, id := range s.cfg.Models {
@@ -406,10 +430,25 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(list)
 }
 
+// maxModelFallbackNotes caps the dedup set behind noteModelFallback. Reaching
+// it means a client is inventing model names faster than an operator could read
+// them; the dedup is purely cosmetic, so recording simply stops.
+const maxModelFallbackNotes = 512
+
 // noteModelFallback logs a model substitution once per name, so a chatty client
 // cannot flood the log with the same line.
 func (s *Server) noteModelFallback(requested, used string) {
-	if _, seen := s.modelFallbacks.LoadOrStore(strings.TrimSpace(requested), true); !seen {
+	name := strings.TrimSpace(requested)
+	s.fallbackMu.Lock()
+	if s.fallbackSeen == nil {
+		s.fallbackSeen = make(map[string]bool)
+	}
+	seen := s.fallbackSeen[name]
+	if !seen && len(s.fallbackSeen) < maxModelFallbackNotes {
+		s.fallbackSeen[name] = true
+	}
+	s.fallbackMu.Unlock()
+	if !seen {
 		log.Printf("model %q not advertised; using %q (further occurrences are not logged)", requested, used)
 	}
 }
@@ -488,6 +527,7 @@ func (s *Server) resolveModel(requested string) (uid string, known bool) {
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
 		return
 	}
@@ -497,6 +537,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.captureRequest(req, "chat")
+
+	// Parsed before anything upstream: a malformed stop is the client's problem
+	// and must be refused without spending an account's quota on a request that
+	// will be thrown away.
+	stops, err := openai.ParseStop(req.Stop)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+		return
+	}
 
 	model, known := s.resolveModel(req.Model)
 	if !known {
@@ -528,7 +577,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer stream.Close()
 
-	stops := openai.ParseStop(req.Stop)
 	if req.Stream {
 		s.streamChunks(ctx, cancel, w, stream, creds, model, req.StreamOptions, stops)
 		return
@@ -670,6 +718,13 @@ func (s *Server) streamChunks(ctx context.Context, cancel context.CancelFunc, w 
 				}
 				if u.Started {
 					d.ID = u.ID
+					// The backend can open a call without an id. The non-streaming
+					// path synthesizes the same call_N placeholder in Calls(), and
+					// the streamed deltas must carry it too, or a client cannot
+					// correlate the fragments with the call it will execute.
+					if d.ID == "" {
+						d.ID = fmt.Sprintf("call_%d", u.Index)
+					}
 					d.Type = "function"
 				}
 				deltas = append(deltas, d)
@@ -738,9 +793,18 @@ func (s *Server) streamChunks(ctx context.Context, cancel context.CancelFunc, w 
 	})
 
 	if opts != nil && opts.IncludeUsage {
+		// The client explicitly asked for usage, so the field must be present:
+		// omitting it because the backend sent no stats — a generation stopped by
+		// a stop sequence never reports totals — would hand a client that parses
+		// `usage` nothing at all. An explicit zero says "no count available"
+		// without pretending there was none.
+		u := openai.UsageFromStats(usage)
+		if u == nil {
+			u = &openai.Usage{}
+		}
 		out.json(openai.ChatCompletionChunk{
 			ID: id, Object: "chat.completion.chunk", Created: created, Model: model,
-			Choices: []openai.ChunkChoice{}, Usage: openai.UsageFromStats(usage),
+			Choices: []openai.ChunkChoice{}, Usage: u,
 		})
 	}
 
@@ -763,6 +827,15 @@ func (s *Server) writeWholeCompletion(ctx context.Context, w http.ResponseWriter
 			break
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				// The client went away while the answer was being aggregated.
+				// There is nobody left to read a 502, and a disconnect is
+				// routine — IDEs cancel on every keystroke — so stay quiet,
+				// exactly like the streaming paths, instead of recording it as
+				// an upstream failure.
+				log.Printf("client disconnected; cancelled the upstream stream")
+				return
+			}
 			tr.fail(err)
 			s.reportQuotaRefusal(creds, err)
 			writeUpstreamError(w, err)
@@ -852,6 +925,7 @@ func (s *Server) writeWholeCompletion(ctx context.Context, w http.ResponseWriter
 // wrapping the prompt as a single turn.
 func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error", "")
 		return
 	}
@@ -868,7 +942,11 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prompt, _ := legacy.PromptText()
-	stops := openai.ParseStop(legacy.Stop)
+	stops, err := openai.ParseStop(legacy.Stop)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+		return
+	}
 
 	model, known := s.resolveModel(chat.Model)
 	if !known {
@@ -911,6 +989,12 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				// Same as the chat path: a hang-up mid-aggregation is routine
+				// and has no reader for a 502, so it stays quiet.
+				log.Printf("client disconnected; cancelled the upstream stream")
+				return
+			}
 			tr.fail(err)
 			s.reportQuotaRefusal(creds, err)
 			writeUpstreamError(w, err)
@@ -1050,9 +1134,15 @@ func (s *Server) streamCompletion(ctx context.Context, cancel context.CancelFunc
 	send("", &finish)
 
 	if opts != nil && opts.IncludeUsage {
+		// Same as the chat stream: an explicit zero rather than an omitted
+		// field, because the client asked for the line item by name.
+		u := openai.UsageFromStats(usage)
+		if u == nil {
+			u = &openai.Usage{}
+		}
 		out.json(openai.CompletionChunk{
 			ID: id, Object: "text_completion", Created: created, Model: model,
-			Choices: []openai.CompletionChunkChoice{}, Usage: openai.UsageFromStats(usage),
+			Choices: []openai.CompletionChunkChoice{}, Usage: u,
 		})
 	}
 
