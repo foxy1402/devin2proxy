@@ -451,6 +451,15 @@ turns as `USER` prompts labelled `Assistant: ` and appends a sentence to the
 system prompt explaining the convention, so the model does not read its own
 earlier replies as user input.
 
+The `prompt` field itself is kept deliberately small. The backend runs a
+content screen over it that refuses some text outright with an opaque
+`permission_denied` (see the troubleshooting notes in the README), and most
+IDEs ship system prompts their users cannot edit. So field 2 always carries
+this proxy's own short instruction, and the client's system prompt rides
+along as a `<system>`-tagged block inside the first `USER` turn — the same
+way the CLI carries non-user context like the `<system_info>` block above.
+Nothing the client sent is dropped; only its position on the wire changes.
+
 ### Tool calls arrive fragmented
 
 `delta_tool_calls` does **not** deliver one complete tool call per frame. The

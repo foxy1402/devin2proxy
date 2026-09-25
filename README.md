@@ -378,7 +378,9 @@ stray `go test` cannot spend quota.
 cd tools && npm install openai
 set DEVIN2PROXY_BASE=http://127.0.0.1:8788/v1   # or https://… with the cert
 set DEVIN2PROXY_API_KEY=sk-devin-…
-node ide-sim-test.mjs      # 14 checks: FIM, stop, images, tool round trip, abort, 501
+node ide-sim-test.mjs      # 24 checks: FIM, stop, images, tool round trip, abort, 501,
+                           # and the full agentic session (rich system prompt, heavy
+                           # toolset, create → run → edit → run → delete, recall)
 node openai-sdk-test.mjs   # 10 checks: models, chat, usage, streaming, tools, 401
 ```
 

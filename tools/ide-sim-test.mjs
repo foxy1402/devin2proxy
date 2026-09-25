@@ -411,6 +411,10 @@ await section("agentic IDE session", async () => {
   check("agentic: round 1 is create_file", byName(call) === "create_file", byName(call));
   check("agentic: create arguments are valid JSON with the content", args(call)?.path === FILE && /hello from the ide sim/.test(args(call)?.content ?? ""), oneLine(call?.function?.arguments ?? ""));
   check("agentic: round 1 finish_reason is tool_calls", finish === "tool_calls", String(finish));
+  // Without a call, the history below would carry tool_calls: [null] and the
+  // SDK would throw mid-section, hiding the remaining results. The round-1
+  // checks above already recorded the failure; stop here cleanly.
+  if (!call) return;
 
   // Rounds 2..5 — non-streaming, accumulated history. Each round instructs one
   // step; every round must answer with the next tool call, not prose.

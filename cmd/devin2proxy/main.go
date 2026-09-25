@@ -508,6 +508,11 @@ func loadConfig(path string) (Config, bool, error) {
 			return cfg, false, err
 		}
 		cfg.APIKey = key
+		// Normalise the same defaults the exists-branch normalises, so the file
+		// a first run writes never carries a zero that quietly means "default".
+		if cfg.MaxToolDescBytes == 0 {
+			cfg.MaxToolDescBytes = openai.DefaultMaxToolDescBytes
+		}
 		return cfg, true, writeConfig(path, cfg)
 
 	default:
