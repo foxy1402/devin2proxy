@@ -644,6 +644,52 @@ func TestDecodeAccountStatusReadsBothShapes(t *testing.T) {
 	}
 }
 
+// TestDecodeAccountStatusReadsTopLevelPlanFallback covers the day the backend
+// stops duplicating the plan block inside user_status (field 13) and leaves it
+// only at the response's top-level field 2. The quota fields must still arrive,
+// or ResetDeadline fails open to "no quota extension" and a rate-limited account
+// is retried against a window that has nothing left.
+func TestDecodeAccountStatusReadsTopLevelPlanFallback(t *testing.T) {
+	// A user_status with identity but no plan block, wrapped alongside a
+	// top-level plan_info at field 2.
+	inner := pb.NewWriter()
+	inner.String(7, "someone@example.com")
+	w := pb.NewWriter()
+	w.RawBytes(1, inner.Bytes())
+	w.Message(2, func(plan *pb.Writer) {
+		plan.Varint(15, 3)
+		plan.Varint(18, 1790496000)
+	})
+
+	got := DecodeAccountStatus(w.Bytes())
+	if got.Email != "someone@example.com" {
+		t.Fatalf("email = %q", got.Email)
+	}
+	if got.WeeklyRemainingPercent == nil || *got.WeeklyRemainingPercent != 3 {
+		t.Fatalf("weekly percentage = %v, want 3 from the top-level plan_info", got.WeeklyRemainingPercent)
+	}
+	if !got.WeeklyReset.Equal(time.Unix(1790496000, 0).UTC()) {
+		t.Fatalf("weekly reset = %s, want the top-level value", got.WeeklyReset)
+	}
+}
+
+// TestInnerPlanWinsOverTheTopLevelCopy pins the precedence: when both copies are
+// present — which is the live shape today — the inner field 13 is the verified
+// one the CLI's own cache reads, so the fallback must not overwrite it.
+func TestInnerPlanWinsOverTheTopLevelCopy(t *testing.T) {
+	inner := pb.NewWriter()
+	inner.String(7, "someone@example.com")
+	inner.Message(13, func(plan *pb.Writer) { plan.Varint(15, 41) })
+	w := pb.NewWriter()
+	w.RawBytes(1, inner.Bytes())
+	w.Message(2, func(plan *pb.Writer) { plan.Varint(15, 99) })
+
+	got := DecodeAccountStatus(w.Bytes())
+	if got.WeeklyRemainingPercent == nil || *got.WeeklyRemainingPercent != 41 {
+		t.Fatalf("weekly percentage = %v, want 41 from the inner plan block", got.WeeklyRemainingPercent)
+	}
+}
+
 func TestDecodeAccountStatusModelList(t *testing.T) {
 	t.Run("a uid is taken from the spec block when the entry has none", func(t *testing.T) {
 		w := pb.NewWriter()

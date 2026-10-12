@@ -115,6 +115,23 @@ func (w *Writer) RawBytes(field int, b []byte) {
 	w.buf = append(w.buf, b...)
 }
 
+// PackedVarints writes a repeated varint field in packed form: one
+// length-delimited field holding the concatenated varints. proto3 defaults
+// repeated scalars to packed, which is how the CLI sends Metadata's field 30;
+// an unpacked run is equally legal on the wire and a parser accepts both, so
+// this exists for fidelity rather than correctness. An empty slice writes
+// nothing, matching proto3's omission of an empty repeated field.
+func (w *Writer) PackedVarints(field int, vals []uint64) {
+	if len(vals) == 0 {
+		return
+	}
+	sub := NewWriter()
+	for _, v := range vals {
+		sub.varint(v)
+	}
+	w.RawBytes(field, sub.Bytes())
+}
+
 // Message writes a nested message built by fn.
 func (w *Writer) Message(field int, fn func(*Writer)) {
 	sub := NewWriter()

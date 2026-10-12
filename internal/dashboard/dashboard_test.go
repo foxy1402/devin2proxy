@@ -41,6 +41,23 @@ func testDashboard(t *testing.T) *Dashboard {
 	})
 }
 
+// statusStub answers a GetUserStatus call locally with the given body, so a test
+// that exercises account verification does not reach the real backend.
+func statusStub(t *testing.T, statusBody []byte) *httptest.Server {
+	t.Helper()
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/GetUserStatus") {
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/proto")
+		w.Write(statusBody)
+	}))
+	t.Cleanup(stub.Close)
+	return stub
+}
+
 // post sends a JSON body from the loopback address the dashboard trusts.
 func post(t *testing.T, d *Dashboard, path string, body any, cookies ...*http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
@@ -430,7 +447,12 @@ func TestCrossOriginRequestsAreRefused(t *testing.T) {
 
 func TestAccountsAddAndDeleteGoThroughTheStore(t *testing.T) {
 	d := testDashboard(t)
-	d.cfg.Pool = devin.NewPool(nil, "")
+	// A local status stub, so the add path's verification never reaches the real
+	// backend with a fake token: the credential is accepted, which is what this
+	// test is about.
+	stub := statusStub(t, accountStatusBody("new@example.com"))
+	d.cfg.Pool = devin.NewPool(nil, stub.URL)
+	d.cfg.Client = devin.NewClient(devin.Options{MaxConcurrent: 1})
 	rec := post(t, d, "/dashboard/api/login", map[string]string{"password": "correct-horse-battery"})
 	cookie := sessionCookieFrom(t, rec)
 
@@ -470,6 +492,59 @@ func TestAccountsAddAndDeleteGoThroughTheStore(t *testing.T) {
 	if stored := d.cfg.Store.Accounts(); len(stored) != 0 {
 		t.Errorf("stored accounts after delete = %v, want none", stored)
 	}
+}
+
+// TestPastedTokenTheBackendRejectsIsRolledBack covers the paste path refusing a
+// credential the backend definitively rejects, matching the OAuth path: admitting
+// it would join the rotation and eat a 401 (plus a five-minute cooldown) on the
+// first request it served. A transient failure to reach the backend must NOT roll
+// the account back — the token may be fine — which the second case pins.
+func TestPastedTokenTheBackendRejectsIsRolledBack(t *testing.T) {
+	t.Run("a 401 from the backend rolls the account back", func(t *testing.T) {
+		d := testDashboard(t)
+		stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"code":"unauthenticated","message":"Invalid token"}`))
+		}))
+		t.Cleanup(stub.Close)
+		d.cfg.Pool = devin.NewPool(nil, stub.URL)
+		d.cfg.Client = devin.NewClient(devin.Options{MaxConcurrent: 1})
+		cookie := sessionCookieFrom(t, post(t, d, "/dashboard/api/login", map[string]string{"password": "correct-horse-battery"}))
+
+		got := post(t, d, "/dashboard/api/accounts/add",
+			map[string]string{"token": "devin-session-token$badbadbad"}, cookie)
+		if got.Code != http.StatusBadGateway {
+			t.Fatalf("adding a rejected token: status %d, want 502 (body %s)", got.Code, got.Body)
+		}
+		if d.cfg.Pool.Len() != 0 {
+			t.Fatalf("pool length = %d, want 0: a rejected token must not stay", d.cfg.Pool.Len())
+		}
+		if stored := d.cfg.Store.Accounts(); len(stored) != 0 {
+			t.Fatalf("stored accounts = %v, want none: the rollback must persist", stored)
+		}
+	})
+
+	t.Run("a transport failure only warns", func(t *testing.T) {
+		d := testDashboard(t)
+		// A port nothing is listening on: the status call fails at the transport
+		// level, not with a rejection.
+		dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		deadURL := dead.URL
+		dead.Close()
+		d.cfg.Pool = devin.NewPool(nil, deadURL)
+		d.cfg.Client = devin.NewClient(devin.Options{MaxConcurrent: 1})
+		cookie := sessionCookieFrom(t, post(t, d, "/dashboard/api/login", map[string]string{"password": "correct-horse-battery"}))
+
+		got := post(t, d, "/dashboard/api/accounts/add",
+			map[string]string{"token": "devin-session-token$maybefine"}, cookie)
+		if got.Code != http.StatusOK {
+			t.Fatalf("adding a token we could not verify: status %d, want 200 (body %s)", got.Code, got.Body)
+		}
+		if d.cfg.Pool.Len() != 1 {
+			t.Fatalf("pool length = %d, want 1: a transient failure must not drop a valid account", d.cfg.Pool.Len())
+		}
+	})
 }
 
 func TestAccountsAreNotEditableWhenThePoolComesFromConfig(t *testing.T) {

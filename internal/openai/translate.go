@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"unicode/utf8"
 
@@ -44,7 +45,10 @@ const (
 
 func clampTemperature(v float64) float64 {
 	switch {
-	case v <= 0:
+	// NaN compares false against everything, so an explicit test is needed or it
+	// falls through the clamps and is sent upstream. Go's JSON decoder rejects
+	// NaN so a real client cannot reach this, but a library caller can.
+	case math.IsNaN(v) || v <= 0:
 		return MinTemperature
 	case v > MaxTemperature:
 		return MaxTemperature
@@ -55,7 +59,7 @@ func clampTemperature(v float64) float64 {
 
 func clampTopP(v float64) float64 {
 	switch {
-	case v <= 0:
+	case math.IsNaN(v) || v <= 0:
 		return MinTopP
 	case v > MaxTopP:
 		return MaxTopP

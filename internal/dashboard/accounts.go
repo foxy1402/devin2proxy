@@ -189,8 +189,27 @@ func (d *Dashboard) handleAccountAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	d.logf("dashboard: account added to the pool as slot %d (…%s)", idx+1, tailOf(token))
 
+	added := d.cfg.Pool.CredentialAt(idx)
 	email, statusErr := d.rememberStatus(r.Context(), idx)
 	if statusErr != nil {
+		// A credential the backend definitively refuses is rolled back rather
+		// than kept: admitting it would join the rotation and eat a 401 (and a
+		// five-minute cooldown) on the first request it served, which is the
+		// opposite of what the pool is for. This matches the OAuth path, which
+		// verifies before admitting. Any other failure — an unreachable backend,
+		// a timeout — is tolerated: the token may well be fine, so it stays in
+		// the pool with a warning instead of being refused on a transient error.
+		if devin.IsCredentialRejection(statusErr) {
+			// Removed by identity, not by index: a concurrent dashboard action can
+			// renumber the pool during the status call above, and removing through
+			// the stale index would delete — and then persist — the wrong account.
+			d.cfg.Pool.RemoveCredential(added)
+			d.cfg.Store.SetAccounts(d.cfg.Pool.Tokens())
+			d.logf("dashboard: refused a pasted token the backend rejected: %v", statusErr)
+			d.deny(w, r, http.StatusBadGateway,
+				"the backend rejected that credential: "+statusErr.Error())
+			return
+		}
 		// The account is in the pool either way. A status failure means the token
 		// could not be asked about it — which is worth saying, because it usually
 		// means the token is bad.

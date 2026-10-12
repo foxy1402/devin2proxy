@@ -361,6 +361,10 @@ func TestStripEgressCredentials(t *testing.T) {
 		{"an @ inside a password", "http://user:se@cret@host:3128", "http://" + CredentialMask + "@host:3128"},
 		{"userinfo with a fragment", "http://user:secret@host:3128#f@g", "http://" + CredentialMask + "@host:3128#f@g"},
 		{"no scheme is left alone", "host:3128", "host:3128"},
+		// A scheme-less spec is what newEgress rejects by name, so its userinfo
+		// must be masked too or the rejection carries the password into the log.
+		{"scheme-less userinfo", "user:secret@host:1080", CredentialMask + "@host:1080"},
+		{"scheme-less userinfo with a path-@ trick", "user:secret@host:1080/a@b", CredentialMask + "@host:1080/a@b"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -901,6 +905,60 @@ func TestHTTPProxyAuthAndStatusHandling(t *testing.T) {
 		}
 		waitHits(t, hits, 1)
 	})
+}
+
+// TestProxyCannotReflectOurCredentialsIntoTheError covers a hostile or broken
+// HTTP proxy that echoes the request — including the Proxy-Authorization header
+// — back in a 407 body. That body is interpolated into the route's error, which
+// is logged and shown in the dashboard's log view, so the base64 credential must
+// be scrubbed or the route's password leaks through its own refusal.
+func TestProxyCannotReflectOurCredentialsIntoTheError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				// Reflect the Proxy-Authorization verbatim, the way a naive proxy
+				// echoes the offending request in its error page.
+				reflected := req.Header.Get("Proxy-Authorization")
+				body := "rejected: " + reflected
+				fmt.Fprintf(c, "HTTP/1.1 407 Proxy Authentication Required\r\n"+
+					"Content-Length: %d\r\n\r\n%s", len(body), body)
+			}(conn)
+		}
+	}()
+
+	const user, pass = "alice", "s3cret"
+	cred := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+	pool, err := NewEgressPool([]string{"http://" + user + ":" + pass + "@" + ln.Addr().String()},
+		EgressOptions{HeaderTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := NewClient(Options{Egress: pool, MaxConcurrent: 1})
+	_, err = callOnce(t, client, "http://127.0.0.1:1")
+	if err == nil {
+		t.Fatal("expected the 407 to surface")
+	}
+	if strings.Contains(err.Error(), cred) {
+		t.Fatalf("the route's error leaks the base64 credential: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "proxy answered 407") {
+		t.Fatalf("error = %q, want the proxy's status preserved", err.Error())
+	}
 }
 
 // ---- routing resilience ------------------------------------------------

@@ -741,9 +741,7 @@ func (m *Metadata) appendTo(w *pb.Writer) {
 	w.String(mdIDEVersion, m.IDEVersion)
 	w.String(mdExtensionName, m.ExtensionName)
 	w.String(mdField28, m.Field28)
-	for _, v := range m.Field30 {
-		w.Varint(mdField30, v)
-	}
+	w.PackedVarints(mdField30, m.Field30)
 	w.String(mdField31, m.Field31)
 }
 

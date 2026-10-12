@@ -206,12 +206,17 @@ const CredentialMask = "***:***"
 // because a URL round trip escapes the mask into %2A%2A%2A and the masked route is
 // meant to be readable — it is shown to a person and matched against what they
 // pasted back.
+//
+// A spec with no scheme is handled too: newEgress rejects such a spec by name
+// (MaskSpec), so a scheme-less user:pass@host would otherwise carry its password
+// into that error. The whole spec is the authority in that case.
 func stripEgressCredentials(spec string) string {
-	schemeEnd := strings.Index(spec, "://")
-	if schemeEnd < 0 {
-		return spec
+	scheme := ""
+	rest := spec
+	if i := strings.Index(spec, "://"); i >= 0 {
+		scheme = spec[:i+3]
+		rest = spec[i+3:]
 	}
-	rest := spec[schemeEnd+3:]
 	// Userinfo can only live in the authority, which ends at the first slash,
 	// question mark or hash. Searching the whole remainder would let a later `@`
 	// in a path or query win LastIndex and leave real credentials behind, so the
@@ -228,7 +233,7 @@ func stripEgressCredentials(spec string) string {
 	if at < 0 {
 		return spec
 	}
-	return spec[:schemeEnd+3] + CredentialMask + "@" + authority[at+1:] + tail
+	return scheme + CredentialMask + "@" + authority[at+1:] + tail
 }
 
 // HasMaskedCredentials reports whether a spec still carries the mask, which means
@@ -770,8 +775,9 @@ func dialHTTPConnect(e *Egress, ctx context.Context, scheme, proxyAddr, user, pa
 	// is visible here rather than depending on net/http's special-casing of the
 	// method.
 	head := "CONNECT " + target + " HTTP/1.1\r\nHost: " + target + "\r\n"
+	cred := ""
 	if user != "" || pass != "" {
-		cred := base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
+		cred = base64.StdEncoding.EncodeToString([]byte(user + ":" + pass))
 		head += "Proxy-Authorization: Basic " + cred + "\r\n"
 	}
 	if _, err := io.WriteString(conn, head+"\r\n"); err != nil {
@@ -794,6 +800,14 @@ func dialHTTPConnect(e *Egress, ctx context.Context, scheme, proxyAddr, user, pa
 		_ = resp.Body.Close()
 		message := "proxy answered " + resp.Status
 		if detail := strings.TrimSpace(string(body)); detail != "" {
+			// A hostile or broken proxy can reflect the request back in its error
+			// body — including the Proxy-Authorization header we just sent — and
+			// this message reaches the process log and the dashboard's log view.
+			// Scrub our own credential out of it so a reflected copy cannot put
+			// the route's password, base64-encoded, into the logs.
+			if cred != "" {
+				detail = strings.ReplaceAll(detail, cred, CredentialMask)
+			}
 			message += ": " + strings.ReplaceAll(detail, "\n", " ")
 		}
 		err := errors.New(message)

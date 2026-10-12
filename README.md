@@ -141,7 +141,7 @@ config file** — which is what makes `read_only: true` work.
 | Variable | `config.json` field | Default | Meaning |
 |---|---|---|---|
 | `DEVIN2PROXY_ADDR` | `addr` | `127.0.0.1:8788` (image: `0.0.0.0:8788`) | listen address |
-| `DEVIN2PROXY_API_KEY` | `api_key` | generated | the one key gating `/v1`; required — with no key the server fails closed with `503` |
+| `DEVIN2PROXY_API_KEY` | `api_key` | generated | the one key gating `/v1`; required — the server refuses to start without one |
 | `DEVIN_TOKEN` / `WINDSURF_API_KEY` | — | — | session token, overriding the CLI's file |
 | `DEVIN_CREDENTIALS_PATH` | — | the CLI's path | read a mounted `credentials.toml` instead |
 | `DEVIN2PROXY_TOKENS` | `tokens` | — | account pool, comma-separated; rotates one account per request |
@@ -157,7 +157,7 @@ config file** — which is what makes `read_only: true` work.
 | `DEVIN2PROXY_DASHBOARD_ALLOW_REMOTE` | `dashboard_allow_remote` | `false` | allow the dashboard from outside the machine; behind a reverse proxy on the same host every visitor appears loopback, so this also means every visitor passes the local-only guard and failed logins share one ban bucket — put the proxy's own auth in front |
 | `DEVIN2PROXY_DEVIN_CLI` | `devin_cli` | — | path to the `devin` CLI; shown in the dashboard's terminal command and run by its sign-out endpoint (the sign-in itself never needs it) |
 | `DEVIN2PROXY_DASHBOARD_WEBAPP_HOST` | `dashboard_webapp_host` | `app.devin.ai` | host serving `/auth/cli/continue`, for a non-default sign-in deployment |
-| `DEVIN2PROXY_DASHBOARD_ECHO_URL` | `dashboard_echo_url` | — | endpoint answering with the caller's address as plain text, fetched through a route when it is tested; `-` skips it |
+| `DEVIN2PROXY_DASHBOARD_ECHO_URL` | `dashboard_echo_url` | `https://api.ipify.org` | endpoint answering with the caller's address as plain text, fetched through a route **only when that route is tested**; `-` skips it (set `-` if you do not want a route test to contact a third party with the exit IP) |
 | `DEVIN2PROXY_MODEL` | `model` | `swe-1-6-slow` | default model; a non-backend uid is a start-up error |
 | `DEVIN2PROXY_MODELS` | `models` | `swe-1-6-slow, swe-1.6, swe` | advertised ids |
 | `DEVIN2PROXY_MIN_MAX_TOKENS` | `min_max_tokens` | `8192` | floor on a client's `max_tokens` — see [Models](#models) |
@@ -174,8 +174,10 @@ The credential file (when used) is re-read **per request**, so re-running
 Two independent surfaces, deliberately:
 
 - **`/v1` — one fixed API key.** Every route requires `Authorization: Bearer
-  <key>` (or `x-api-key`). No key configured → every request is refused with
-  `503`; the server never serves the account unprotected. A wrong key gets
+  <key>` (or `x-api-key`). No key is never served: the binary refuses to start
+  without one (set `DEVIN2PROXY_API_KEY` or delete `config.json` to regenerate),
+  and the server additionally answers `503` if a library embedder starts it with
+  no key, so the account is never reachable unprotected. A wrong key gets
   `401` after a 250 ms floor, which makes online guessing of the key
   pointless. Correct keys never pay the delay.
 - **`/dashboard/` — a password, and nothing else.** Every page, button and
@@ -284,7 +286,8 @@ every request, and clients that don't know the field ignore it.
 | `stream`, `stream_options.include_usage` | honoured (the final `include_usage` chunk always carries `usage`, zeroed when the backend reported none) |
 | `tools`, `tool_choice: auto/none` | honoured; `required`/named-function → `400` (the backend has no field for it) |
 | `response_format`, penalties, `seed` | accepted but **not enforced** — one log line per request notes the unenforced fields (JSON-mode clients get free-form prose) |
-| `n`, `logprobs`, `reasoning_effort` | ignored silently |
+| `n` | `1` (or omitted) works; anything else → `400` (one completion per request) |
+| `logprobs`, `reasoning_effort` | ignored silently |
 | unknown JSON fields | dropped, not rejected; an unknown content-part type in a multimodal message → `400` |
 
 The context window is not a request parameter in OpenAI's API at all — set it
@@ -314,8 +317,11 @@ Feed the pool via `DEVIN2PROXY_TOKENS(_FILE)` (shown read-only in the
 dashboard), or manage it live from the dashboard: **Add account (OAuth)**
 runs the CLI's PKCE sign-in in-process — you sign in on a Devin page, paste
 the code back, the token is verified against the backend before it joins the
-pool. The proxy only ever *reads* `credentials.toml`; it never writes to your
-Devin configuration.
+pool. **Add token** takes a pasted session token the same way: one
+the backend definitively refuses is rejected rather than admitted, and any
+other failure to reach the backend only warns, so a transient outage does not
+cost you a valid account. The proxy only ever *reads* `credentials.toml`; it
+never writes to your Devin configuration.
 
 ## Outbound proxies
 

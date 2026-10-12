@@ -288,7 +288,13 @@ func New(cfg Config, client *devin.Client) *Server {
 	if cfg.AllowOrigins == "" {
 		cfg.AllowOrigins = "*"
 	}
-	if cfg.AuthFailureDelay == 0 {
+	// Zero means "use the floor". So does a negative value, which would otherwise
+	// pass through to time.Sleep as a no-op and silently remove the floor: the
+	// comment above promises New clamps it, and a config file is exactly the kind
+	// of input that should not be able to switch a timing defence off by writing
+	// -1. A positive value below the default is still honoured, so a test can
+	// lower the delay.
+	if cfg.AuthFailureDelay <= 0 {
 		cfg.AuthFailureDelay = authFailureDelay
 	}
 	s := &Server{
@@ -609,13 +615,16 @@ func newSSEWriter(w http.ResponseWriter) (*sseWriter, bool) {
 	return &sseWriter{w: w, flusher: flusher}, true
 }
 
-// json writes one data frame.
+// json writes one data frame. A marshal failure is recorded like a write
+// failure rather than dropped silently: the frame is lost either way, and
+// failed() is what tells the caller the stream is broken.
 func (s *sseWriter) json(v any) {
 	if s.err != nil {
 		return
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
+		s.err = err
 		return
 	}
 	s.data(string(b))

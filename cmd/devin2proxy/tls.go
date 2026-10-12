@@ -144,13 +144,66 @@ func generateSelfSigned(certPath, keyPath string, names []string) error {
 			}
 		}
 	}
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", keyPath, err)
+	// Install the pair as close to atomically as the filesystem allows: both
+	// halves are written to temporary files first, and only then renamed into
+	// place. A crash therefore cannot leave a truncated file, and the window in
+	// which one half is new and the other is old is down to the two renames
+	// rather than spanning the whole generation and the first write.
+	return writePairAtomic(certPath, certPEM, keyPath, keyPEM)
+}
+
+// writePairAtomic writes two files via temporary files in their own directories
+// and renames both into place, so neither can be observed truncated. file1 is
+// expected to be the certificate (0644) and file2 the private key (0600); both
+// directories are assumed to exist.
+func writePairAtomic(path1 string, data1 []byte, path2 string, data2 []byte) error {
+	tmp1, err := writeTemp(path1, data1, 0o644)
+	if err != nil {
+		return fmt.Errorf("write %s: %w", path1, err)
 	}
-	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", certPath, err)
+	defer os.Remove(tmp1)
+	tmp2, err := writeTemp(path2, data2, 0o600)
+	if err != nil {
+		return fmt.Errorf("write %s: %w", path2, err)
+	}
+	defer os.Remove(tmp2)
+	// Certificate first, key last: serveCertificate treats the presence of only
+	// one half as an error, and a stray certificate beside a missing key is the
+	// half that is safe to be briefly visible, since it is public anyway.
+	if err := os.Rename(tmp1, path1); err != nil {
+		return fmt.Errorf("write %s: %w", path1, err)
+	}
+	if err := os.Rename(tmp2, path2); err != nil {
+		return fmt.Errorf("write %s: %w", path2, err)
 	}
 	return nil
+}
+
+// writeTemp writes b to a fresh temporary file beside path with the given mode
+// and returns its name. The caller renames it into place or removes it.
+func writeTemp(path string, b []byte, mode os.FileMode) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(name)
+		return "", err
+	}
+	// CreateTemp already opens 0600; set the mode explicitly so it is part of
+	// the contract rather than an accident of the standard library.
+	if err := f.Chmod(mode); err != nil {
+		f.Close()
+		os.Remove(name)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(name)
+		return "", err
+	}
+	return name, nil
 }
 
 func uniqueStrings(in []string) []string {

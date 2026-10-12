@@ -100,3 +100,60 @@ func TestSkipStillSkipsWellFormedFields(t *testing.T) {
 		t.Fatalf("skipping stopped at %d of %d bytes", r.Pos(), len(w.Bytes()))
 	}
 }
+
+// TestPackedVarintsRoundTrip pins the encoder against the decoder: a packed
+// repeated field must come back as the values that went in, which is what lets
+// Metadata's field 30 match the packed form the CLI sends.
+func TestPackedVarintsRoundTrip(t *testing.T) {
+	w := NewWriter()
+	w.PackedVarints(30, []uint64{7, 9, 300, 0, 1})
+	got := decodePacked(t, w.Bytes(), 30)
+	want := []uint64{7, 9, 300, 0, 1}
+	if len(got) != len(want) {
+		t.Fatalf("decoded %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("decoded %v, want %v", got, want)
+		}
+	}
+}
+
+// TestPackedVarintsEmptyWritesNothing keeps an empty repeated field off the
+// wire entirely, matching proto3's omission of an empty repeated field.
+func TestPackedVarintsEmptyWritesNothing(t *testing.T) {
+	w := NewWriter()
+	w.PackedVarints(30, nil)
+	if len(w.Bytes()) != 0 {
+		t.Fatalf("empty PackedVarints wrote % x, want nothing", w.Bytes())
+	}
+}
+
+// decodePacked reads back a packed varint field by number.
+func decodePacked(t *testing.T, b []byte, wantField int) []uint64 {
+	t.Helper()
+	var out []uint64
+	r := NewReader(b)
+	for {
+		field, wire, ok := r.Field()
+		if !ok {
+			break
+		}
+		if field == wantField && wire == WireBytes {
+			sub := NewReader(r.Bytes())
+			for sub.Remaining() > 0 {
+				v := sub.Varint()
+				if sub.Err() != nil {
+					break
+				}
+				out = append(out, v)
+			}
+			continue
+		}
+		r.Skip(wire)
+	}
+	if err := r.Err(); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return out
+}

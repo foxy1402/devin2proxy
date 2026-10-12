@@ -3,6 +3,7 @@ package devin
 import (
 	"context"
 	"errors"
+	"log"
 	"strings"
 	"time"
 
@@ -201,6 +202,13 @@ func DecodeAccountStatus(b []byte) *AccountStatus {
 
 func decodeStatusFields(b []byte, s *AccountStatus, depth int) {
 	var inner []byte
+	// The response is { 1: user_status, 2: plan_info }, and the inner user_status
+	// carries the same plan block at its own field 13, which is the copy the
+	// CLI's cache stores and the one PROTOCOL.md verified. The top-level field 2
+	// is kept as a fallback for the day the backend stops duplicating it: without
+	// this, quota and plan reads would go blind on a response that still carries
+	// them, and ResetDeadline would fail open to "no quota extension".
+	var planFallback []byte
 	r := pb.NewReader(b)
 	for {
 		field, wire, ok := r.Field()
@@ -210,6 +218,8 @@ func decodeStatusFields(b []byte, s *AccountStatus, depth int) {
 		switch {
 		case field == 1 && wire == pb.WireBytes:
 			inner = r.Bytes()
+		case field == 2 && wire == pb.WireBytes && depth == 0:
+			planFallback = r.Bytes()
 		case field == 3 && wire == pb.WireBytes:
 			s.Name = r.String()
 		case field == 5 && wire == pb.WireBytes:
@@ -231,6 +241,29 @@ func decodeStatusFields(b []byte, s *AccountStatus, depth int) {
 	if depth == 0 && s.Email == "" && s.Name == "" && len(inner) > 0 {
 		decodeStatusFields(inner, s, 1)
 	}
+	// Only reached when the inner message did not supply a plan: if the verified
+	// field 13 was present this is a no-op, and if it was not, the top-level copy
+	// keeps the numbers and the log line says why the source moved. Gated on the
+	// wrapper being present (field 1) because the bare cache shape has no
+	// plan_info at field 2 at all — reading a UserStatus's own field 2 as a plan
+	// block there would be a misread, so the fallback applies only to the
+	// documented wrapped response.
+	if depth == 0 && len(inner) > 0 && len(planFallback) > 0 && !s.hasPlanData() {
+		log.Printf("devin: status response carried plan_info only at the top level (field 2), not the inner field 13; reading the fallback copy")
+		decodePlan(planFallback, s)
+	}
+}
+
+// hasPlanData reports whether any of the plan block's fields have been filled,
+// which is how the decoder decides whether the top-level plan_info copy is worth
+// consulting.
+func (s *AccountStatus) hasPlanData() bool {
+	return s.Plan != "" ||
+		s.DailyRemainingPercent != nil ||
+		s.WeeklyRemainingPercent != nil ||
+		s.OverageBalanceMicros != nil ||
+		!s.DailyReset.IsZero() ||
+		!s.WeeklyReset.IsZero()
 }
 
 // decodePlan reads the plan block: the plan's name at its nested field 1 → 2, the

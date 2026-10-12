@@ -77,30 +77,29 @@ func TestRateLimitRetryBudgetFollowsThePerRequestFunc(t *testing.T) {
 	// zero — the default budget.
 	t.Run("a live func is read per request and wins over the static field", func(t *testing.T) {
 		srv, hits := rateLimitedBackend(t)
-		var budget atomic.Int32
-		budget.Store(3)
+		// The budget changes between reads to prove it is read per request rather
+		// than sampled once. It is driven by the function itself rather than by a
+		// racing goroutine polling the hit counter: that goroutine could lose the
+		// race and let a third attempt through, which is a flaky failure, not a
+		// real one. The first read (after the first 429) allows three attempts, so
+		// the request retries; every read after that allows one, so the second
+		// refusal returns.
+		var reads atomic.Int32
 		client := NewClient(Options{
-			MaxConcurrent:        1,
-			HeaderTimeout:        5 * time.Second,
-			RateLimitRetries:     3,
-			RateLimitRetriesFunc: func() int { return int(budget.Load()) },
+			MaxConcurrent:    1,
+			HeaderTimeout:    5 * time.Second,
+			RateLimitRetries: 99,
+			RateLimitRetriesFunc: func() int {
+				if reads.Add(1) == 1 {
+					return 3
+				}
+				return 1
+			},
 		})
 		creds := &Credentials{APIKey: "devin-session-token$test", APIServerURL: srv.URL}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		go func() {
-			// After the first refusal has been counted, cut the budget to one: the
-			// request must return rather than retry twice more on the old value.
-			deadline := time.Now().Add(5 * time.Second)
-			for time.Now().Before(deadline) {
-				if hits.Load() >= 1 {
-					budget.Store(1)
-					return
-				}
-				time.Sleep(time.Millisecond)
-			}
-		}()
 		_, err := client.GetChatMessage(ctx, creds, &GetChatMessageRequest{})
 		if err == nil {
 			t.Fatal("a backend that only answers 429 returned no error")

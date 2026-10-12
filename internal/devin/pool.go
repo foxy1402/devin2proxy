@@ -127,10 +127,16 @@ func cleanToken(raw string) string {
 
 // Len reports how many credentials the pool holds. A nil pool holds none, which
 // is how a server running on the CLI's own credential reaches this code.
+//
+// It takes the rotation lock because Add and Remove replace the entries slice
+// header under it: an unlocked len(p.entries) here would race a concurrent
+// dashboard add or delete on the hot path.
 func (p *Pool) Len() int {
 	if p == nil {
 		return 0
 	}
+	p.rot.mu.Lock()
+	defer p.rot.mu.Unlock()
 	return len(p.entries)
 }
 
@@ -151,11 +157,14 @@ func (p *Pool) Available() int {
 //
 // Returns nil only when the pool is empty.
 func (p *Pool) Next() *Credentials {
-	if p == nil || len(p.entries) == 0 {
+	if p == nil {
 		return nil
 	}
 	p.rot.mu.Lock()
 	defer p.rot.mu.Unlock()
+	if len(p.entries) == 0 {
+		return nil
+	}
 	idx := p.rot.pick(time.Now())
 	p.lastRotation = idx
 	return p.entries[idx]
@@ -567,6 +576,11 @@ func (p *Pool) Report(creds *Credentials, status int, err error) {
 		systemic = true
 	}
 	available := p.rot.availableLocked(now)
+	// Snapshot everything the log lines below need while the lock is still held:
+	// a concurrent Add or Remove replaces the entries slice header, so reading
+	// len(p.entries) after the unlock would race the writer. available comes from
+	// the same critical section for the same reason.
+	total := len(p.entries)
 	p.rot.mu.Unlock()
 
 	// The status code alone cannot be acted on: a 403 from a WAF page and a 403
@@ -580,11 +594,11 @@ func (p *Pool) Report(creds *Credentials, status int, err error) {
 		log.Printf("account %d/%d (…%s) was refused with HTTP %d%s and no account is left usable; "+
 			"holding the whole pool out for only %s because a refusal of every account looks like a "+
 			"provider-side change rather than these keys being bad",
-			idx+1, len(p.entries), tail(creds.APIKey), status, detailSuffix(detail), CoolRateLimited)
+			idx+1, total, tail(creds.APIKey), status, detailSuffix(detail), CoolRateLimited)
 	case !alreadyCooling:
 		log.Printf("account %d/%d (…%s) stepped out of rotation for %s after HTTP %d%s; "+
 			"%d/%d accounts still available",
-			idx+1, len(p.entries), tail(creds.APIKey), cool, status, detailSuffix(detail), available, len(p.entries))
+			idx+1, total, tail(creds.APIKey), cool, status, detailSuffix(detail), available, total)
 	}
 
 	// A rate limit is the one refusal that can be told how long it will last, so
@@ -818,6 +832,26 @@ func statusFromConnectCode(code string) int {
 	default:
 		return 0
 	}
+}
+
+// IsCredentialRejection reports whether err is the backend definitively refusing
+// a credential, as opposed to a transport failure, a timeout or a rate limit.
+// Callers that verify a token before admitting it — the dashboard's paste and
+// sign-in paths — use this to refuse a bad token without also refusing a good one
+// that merely could not be reached.
+func IsCredentialRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.Status == 401 || httpErr.Status == 403
+	}
+	var connectErr *ConnectError
+	if errors.As(err, &connectErr) {
+		return statusFromConnectCode(connectErr.Code) == 401 || statusFromConnectCode(connectErr.Code) == 403
+	}
+	return false
 }
 
 // tail returns the last few characters of a secret, enough to tell two accounts
