@@ -30,22 +30,30 @@ jobs:
   # Vet and test before anything is built: the image push below is gated on
   # this job, so a regression cannot ship straight to the tag compose pulls.
   # The live tests in the repo are skipped unless their env vars are set, so
-  # plain `go test ./...` is hermetic.
+  # `go test ./...` is hermetic.
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # The repo is stdlib-only, so there is no go.sum for the cache to key
+          # on; leaving caching on only logs a warning about the missing file.
+          cache: false
 
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test ./...
+      # -race is the gate that would have caught the Pool.Report data race the
+      # cross-audit found: plain `go test` passed it, and only the detector
+      # flagged the unlocked len(p.entries) read. The runner has a C toolchain
+      # (the race detector's cgo requirement), so this is free here and the
+      # suite is small enough that the slowdown does not matter.
+      - name: Test (race detector)
+        run: go test -race ./...
 
   build-and-push:
     needs: test
