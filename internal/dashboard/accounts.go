@@ -204,7 +204,11 @@ func (d *Dashboard) handleAccountAdd(w http.ResponseWriter, r *http.Request) {
 			// renumber the pool during the status call above, and removing through
 			// the stale index would delete — and then persist — the wrong account.
 			d.cfg.Pool.RemoveCredential(added)
-			d.cfg.Store.SetAccounts(d.cfg.Pool.Tokens())
+			// Persist the rollback. If it fails the rejected token is still on disk
+			// and would be reloaded on the next restart, so retry once and, if it
+			// still fails, say so loudly rather than reporting a clean removal that
+			// did not happen.
+			d.persistAfterRollback()
 			d.logf("dashboard: refused a pasted token the backend rejected: %v", statusErr)
 			d.deny(w, r, http.StatusBadGateway,
 				"the backend rejected that credential: "+statusErr.Error())
@@ -221,6 +225,25 @@ func (d *Dashboard) handleAccountAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	d.logf("dashboard: account %d is %s", idx+1, email)
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": d.cfg.Pool.States(), "email": email})
+}
+
+// persistAfterRollback saves the pool after a rejected credential was removed
+// from memory. A failure here is not cosmetic: the store still holds the rejected
+// token, so a restart would reload and serve it, and the 502 the caller is about
+// to see would imply otherwise. One retry covers a transient error; past that the
+// operator has to be told the file still needs a manual edit.
+func (d *Dashboard) persistAfterRollback() {
+	if d.cfg.Store == nil {
+		return
+	}
+	if err := d.cfg.Store.SetAccounts(d.cfg.Pool.Tokens()); err == nil {
+		return
+	}
+	if err := d.cfg.Store.SetAccounts(d.cfg.Pool.Tokens()); err == nil {
+		return
+	}
+	d.logf("dashboard: ERROR the rejected credential was removed from the pool but could not be removed from "+
+		"%s; it will be served again after a restart until it is deleted by hand", d.cfg.Store.Path)
 }
 
 // handleAccountDelete forgets an account. It removes the token from the pool and

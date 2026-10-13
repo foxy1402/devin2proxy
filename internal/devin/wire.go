@@ -26,6 +26,12 @@ const (
 	reqPlannerMode        = 20
 	reqChatModelUID       = 21
 	reqExecutionID        = 22
+	// reqField28 is the per-session codename the CLI sends at top level: an
+	// adjective-noun string ("warm-soul", "accurate-cornucopia") that is stable
+	// within one conversation and different across conversations. It is also the
+	// CLI's on-disk session name (session_locks/<codename>.lock). It must never be
+	// hardcoded to an observed literal; see SessionCodename.
+	reqField28 = 28
 )
 
 // GetChatMessageResponse field numbers.
@@ -290,13 +296,30 @@ type ModelUsageStats struct {
 // omitting both is rejected with invalid_argument. The capture shows the CLI
 // sending {trajectory_id: <uuid>, trajectory_type: 4, field4: 14}, and a freshly
 // generated uuid is accepted, which is what lets a caller start a new
-// conversation.
+// conversation. This is the first-round shape: the CLI sends field 4 = 14 only on
+// the opening round of a conversation.
 func NewTrajectoryReference() *TrajectoryReference {
 	return &TrajectoryReference{
 		TrajectoryID:   MustUUID(),
 		TrajectoryType: 4,
 		Field4:         14,
 		field4Set:      true,
+	}
+}
+
+// NewTrajectoryReferenceContinuation returns a reference for a later round of a
+// conversation already under way.
+//
+// A 2026-10-13 capture of CLI 3000.11.3 shows the difference: the opening round of
+// a conversation carried field 4 = 14, while every later round (and the CLI's
+// title side call) omitted field 4 entirely. The proxy used to send 14 on every
+// request. The backend accepts either — the proxy has worked that way all along —
+// so this is mimicry rather than a fix. The reference still carries a fresh
+// trajectory id and type 4, matching the CLI on those fields.
+func NewTrajectoryReferenceContinuation() *TrajectoryReference {
+	return &TrajectoryReference{
+		TrajectoryID:   MustUUID(),
+		TrajectoryType: 4,
 	}
 }
 
@@ -312,6 +335,9 @@ type GetChatMessageRequest struct {
 	PlannerMode        int
 	ChatModelUID       string
 	ExecutionID        string
+	// Field28 is the per-session codename (see SessionCodename). Empty omits it,
+	// which the backend accepts.
+	Field28 string
 
 	// Unknown records fields we did not recognise, so a schema mismatch shows
 	// up as a log line instead of silently dropping data.
@@ -634,6 +660,8 @@ func DecodeGetChatMessageRequest(b []byte) *GetChatMessageRequest {
 			out.ChatModelUID = r.String()
 		case f == reqExecutionID && w == pb.WireBytes:
 			out.ExecutionID = r.String()
+		case f == reqField28 && w == pb.WireBytes:
+			out.Field28 = r.String()
 		default:
 			out.Unknown = append(out.Unknown, recordUnknown(f, w, r))
 		}
@@ -856,6 +884,7 @@ func EncodeGetChatMessageRequest(in *GetChatMessageRequest) []byte {
 	w.Enum(reqPlannerMode, in.PlannerMode)
 	w.String(reqChatModelUID, in.ChatModelUID)
 	w.String(reqExecutionID, in.ExecutionID)
+	w.String(reqField28, in.Field28)
 	return w.Bytes()
 }
 
@@ -919,6 +948,7 @@ func DescribeRequest(in *GetChatMessageRequest) string {
 	fmt.Fprintf(&sb, "  planner_mode        : %d\n", in.PlannerMode)
 	fmt.Fprintf(&sb, "  chat_model_uid      : %q\n", in.ChatModelUID)
 	fmt.Fprintf(&sb, "  execution_id        : %q\n", in.ExecutionID)
+	fmt.Fprintf(&sb, "  field28             : %q\n", in.Field28)
 	writeUnknown(&sb, in.Unknown)
 	return sb.String()
 }

@@ -1,6 +1,8 @@
 package openai
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -318,6 +320,11 @@ func BuildDevinRequest(apiKey string, req *ChatRequest, model string, opts Optio
 	var systemParts []string
 	var prompts []devin.ChatMessagePrompt
 	var sawAssistant bool
+	// sawPriorTurn records that the history carries an assistant or tool entry,
+	// which is what tells a later round of a conversation from its opening one.
+	// The trajectory reference's field 4 is 14 only on the opening round; see
+	// NewTrajectoryReference and NewTrajectoryReferenceContinuation.
+	var sawPriorTurn bool
 
 	for i, m := range req.Messages {
 		switch strings.ToLower(strings.TrimSpace(m.Role)) {
@@ -348,6 +355,7 @@ func BuildDevinRequest(apiKey string, req *ChatRequest, model string, opts Optio
 			if m.Content.Text == "" && len(m.ToolCalls) == 0 {
 				continue
 			}
+			sawPriorTurn = true
 			// Sent as a user prompt carrying the label, not as an assistant
 			// turn: the backend refuses any source other than USER/SYSTEM/TOOL.
 			// A turn that only calls a tool has no text of its own, but the
@@ -376,6 +384,7 @@ func BuildDevinRequest(apiKey string, req *ChatRequest, model string, opts Optio
 			prompts = append(prompts, p)
 
 		case "tool", "function":
+			sawPriorTurn = true
 			// A tool result with no text would vanish from the wire: an empty
 			// prompt field is dropped, and the model would then see the tool
 			// call it made and no answer to it. The user branch guards the same
@@ -511,10 +520,28 @@ func BuildDevinRequest(apiKey string, req *ChatRequest, model string, opts Optio
 			MaxNewlines:    DefaultMaxNewlines,
 		},
 		// A fresh trajectory is what starts a new conversation. Without it (and
-		// without a cascade id the backend already knows) it rejects the call.
-		TrajectoryRef: devin.NewTrajectoryReference(),
-		PlannerMode:   devin.PlannerModeDefault,
-		ChatModelUID:  model,
+		// without a cascade id the backend already knows) it rejects the call. The
+		// opening round carries field 4 = 14; a later round (its history already
+		// holds an assistant or tool turn) omits it, as the CLI does.
+		TrajectoryRef: trajectoryReference(sawPriorTurn),
+		// The CLI sends a cascade_id alongside the trajectory reference: a UUID
+		// that stays fixed for every round of one conversation (verified in a
+		// 2026-10-13 capture — rounds read/write/answer all shared one id, and the
+		// CLI's title side call shared it too). This proxy is stateless across
+		// requests, so it cannot know where one conversation ends and the next
+		// begins; a fresh id per request is the practical baseline, and it stays
+		// consistent with the fresh trajectory reference above (both describe the
+		// same, new conversation to the backend). See docs/PROTOCOL.md.
+		CascadeID:    devin.MustUUID(),
+		PlannerMode:  devin.PlannerModeDefault,
+		ChatModelUID: model,
+		// Field 28 is the CLI's per-session codename. It is generated, never a
+		// fixed literal: a hardcoded value would fingerprint every request as one
+		// named session. Like the cascade id above, this proxy is stateless across
+		// requests, so it cannot keep one codename for a whole conversation — a
+		// fresh shape-correct one per request is the practical baseline. See
+		// devin.SessionCodename.
+		Field28: devin.SessionCodename(),
 	}
 
 	for _, t := range req.Tools {
@@ -536,6 +563,16 @@ func BuildDevinRequest(apiKey string, req *ChatRequest, model string, opts Optio
 	}
 
 	return out, nil
+}
+
+// trajectoryReference picks the trajectory reference shape for a request: the
+// opening-round form (field 4 = 14) when the history holds no assistant or tool
+// turn yet, and the continuation form otherwise. See NewTrajectoryReference.
+func trajectoryReference(continuation bool) *devin.TrajectoryReference {
+	if continuation {
+		return devin.NewTrajectoryReferenceContinuation()
+	}
+	return devin.NewTrajectoryReference()
 }
 
 func firstInt(vals ...*int) *int {
@@ -632,10 +669,27 @@ func (a *ToolCallAccumulator) Calls() []ToolCall {
 	copy(out, a.calls)
 	for i := range out {
 		if out[i].ID == "" {
-			out[i].ID = fmt.Sprintf("call_%d", i)
+			out[i].ID = PlaceholderToolCallID()
 		}
 	}
 	return out
+}
+
+// PlaceholderToolCallID mints an id for a tool call the backend opened without
+// one, in the same shape the backend mints its own: "call_" followed by 24 hex
+// characters (verified against CLI 3000.11.3 responses on 2026-10-13, which read
+// `call_7a23ee759f7248f9927a7c7e`). The id round-trips — a client replays it as
+// the tool_call_id on the next request, so a sequential "call_0" would be sent
+// back to the backend as a client-visible tell. Random hex avoids that and cannot
+// collide in practice.
+func PlaceholderToolCallID() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// No meaningful recovery; a short deterministic id is still better than
+		// dropping the call. The backend does not key on this value.
+		return "call_000000000000000000000000"
+	}
+	return "call_" + hex.EncodeToString(b[:])
 }
 
 // Len reports how many tool calls have been opened.

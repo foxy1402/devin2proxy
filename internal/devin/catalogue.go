@@ -18,16 +18,22 @@ import (
 // The field numbers are not documented anywhere; they were read off the wire and
 // are recorded in docs/PROTOCOL.md.
 
-// CLIIdentity is the metadata ide_name the CLI sends, and the only one that gets
-// the real catalogue back.
+// CLIIdentity is the metadata ide_name the CLI's main process sends on its unary
+// calls, and the one the proxy standardises on for them (see UnaryMetadata).
 //
-// The identity is not cosmetic here. Asked as this proxy's own "devin-cli",
-// GetCliModelConfigs answers with a single-entry list of Devin's chat models —
-// the same short list the status call reports at field 33 — and no coding model at
-// all. The CLI's identity is what returns the full catalogue, which is the question
-// this call exists to answer ("what does the CLI see, and what are those models'
-// limits"). The chat path is a different matter and keeps its own identity; see
-// DefaultMetadata and docs/PROTOCOL.md.
+// This constant was originally introduced because the identity appeared to
+// matter: asked as the chat path's own "devin-cli", GetCliModelConfigs answered
+// with a single-entry list of Devin's chat models — the same short list the status
+// call reports at field 33 — and no coding model at all, while "chisel" returned
+// the full catalogue. That gate no longer holds. A live capture of CLI 3000.11.3
+// on 2026-10-13 sent this call under both "chisel" and "devin-cli" and got back
+// the same catalogue bytes both times (3,695,732 B; sha256 298b4e6f…), so the
+// backend does not currently gate the catalogue on ide_name.
+//
+// It is kept as "chisel" because that is the main process's shape, and the name is
+// left alone so a future change to this identity is made deliberately rather than
+// by someone reverting on the now-dead premise that only "chisel" gets a real
+// catalogue. See docs/PROTOCOL.md.
 const CLIIdentity = "chisel"
 
 // catalogueTimeout bounds the catalogue fetch. It is one unary call returning a
@@ -84,8 +90,7 @@ func (c *Client) FetchModelCatalogue(ctx context.Context, creds *Credentials) ([
 	if creds == nil || creds.APIKey == "" {
 		return nil, errors.New("devin: no credential available")
 	}
-	md := DefaultMetadata(creds.APIKey)
-	md.IDEName = CLIIdentity
+	md := UnaryMetadata(creds.APIKey)
 	ctx, cancel := context.WithTimeout(ctx, catalogueTimeout)
 	defer cancel()
 	body, err := c.PostUnary(ctx, creds, GetCliModelConfigsPath, EncodeMetadataRequest(md))

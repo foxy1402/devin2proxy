@@ -77,6 +77,11 @@ type Options struct {
 	// the dashboard can add and delete credentials, so reachable-by-accident is not
 	// an acceptable default.
 	AllowRemote bool
+	// SecureCookie forces the Secure attribute on the dashboard session cookie even
+	// when the request arrives without TLS. It is for a deployment that terminates
+	// TLS at a reverse proxy, where r.TLS is nil and the cookie would otherwise be
+	// set without Secure.
+	SecureCookie bool
 	// AccountsExternal, when non-empty, says the pool is supplied by something the
 	// dashboard cannot change (the environment or config.json) and why, so the UI
 	// can explain the locked list rather than silently ignoring edits.

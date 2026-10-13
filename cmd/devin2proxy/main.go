@@ -107,6 +107,10 @@ type Config struct {
 	// DashboardAllowRemote permits the dashboard from outside this machine. Off by
 	// default: it can add and delete credentials.
 	DashboardAllowRemote bool `json:"dashboard_allow_remote,omitempty"`
+	// DashboardSecureCookie forces the Secure attribute on the dashboard session
+	// cookie even without TLS. Set it when TLS is terminated at a reverse proxy, so
+	// the cookie is not sent over a connection that could be plain HTTP.
+	DashboardSecureCookie bool `json:"dashboard_secure_cookie,omitempty"`
 	// DevinCLI is the Devin CLI on this machine. The dashboard's sign-in does not run
 	// it — the exchange is done in-process — but the path is shown in the command a
 	// person can run in a terminal, and the sign-out endpoint runs it to clear the
@@ -354,6 +358,11 @@ func main() {
 		Addr:              cfg.Addr,
 		Handler:           srv,
 		ReadHeaderTimeout: 30 * time.Second,
+		// ReadTimeout bounds the whole request read, body included: without it a
+		// client can hold a connection open indefinitely by trickling the body one
+		// byte at a time. It is set well above any real body (bodies are capped at
+		// 8 MiB) but finite, so the trickle has a ceiling.
+		ReadTimeout: 5 * time.Minute,
 		// No WriteTimeout: completions legitimately stream for minutes. Idle
 		// keep-alive connections are a different story — on an exposed listener
 		// every port scanner and dead client would otherwise hold a goroutine
@@ -584,8 +593,41 @@ func writeConfig(path string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	// 0600: the file holds the key that authorises quota spend.
-	return os.WriteFile(path, append(b, '\n'), 0o600)
+	// Written beside the target and renamed over it, so a crash or power loss
+	// mid-write cannot leave a truncated config.json — the failure that otherwise
+	// forces the operator to delete it and lose the generated API key. This
+	// mirrors the dashboard store's atomic save, down to the 0600 mode: the file
+	// holds the key that authorises quota spend.
+	dir := filepath.Dir(path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func applyEnv(cfg *Config) {
@@ -664,6 +706,9 @@ func applyEnv(cfg *Config) {
 	}
 	if v, ok := env("DEVIN2PROXY_DASHBOARD_ALLOW_REMOTE"); ok {
 		cfg.DashboardAllowRemote = parseBool(v)
+	}
+	if v, ok := env("DEVIN2PROXY_DASHBOARD_SECURE_COOKIE"); ok {
+		cfg.DashboardSecureCookie = parseBool(v)
 	}
 	if v, ok := env("DEVIN2PROXY_DASHBOARD_ECHO_URL"); ok {
 		cfg.DashboardEchoURL = v
@@ -848,6 +893,7 @@ func buildDashboard(o dashboardOptions) (http.Handler, error) {
 		ProbeTarget:      probeTarget(backendURL()),
 		Egress:           egressOptions(),
 		AllowRemote:      remote,
+		SecureCookie:     o.cfg.DashboardSecureCookie,
 		AccountsExternal: o.accountsFrom,
 		ProxiesExternal:  o.proxiesFrom,
 		// The uids the server passes through when a client names them. The Models panel

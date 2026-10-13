@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -265,9 +266,11 @@ func TestAnIncludeUsageFinalChunkAlwaysCarriesUsage(t *testing.T) {
 }
 
 func TestAStreamedToolCallWithoutAnIDGetsThePlaceholder(t *testing.T) {
-	// The non-streaming path synthesizes call_N ids in Calls(); the streamed
-	// opening delta must carry the same placeholder, or a client cannot
-	// correlate the fragments with the call it will execute.
+	// The non-streaming path synthesizes a placeholder in Calls(); the streamed
+	// opening delta must carry the same placeholder, or a client cannot correlate
+	// the fragments with the call it will execute. The id must have the backend's
+	// own shape — call_ + 24 hex — because a client replays it as the tool_call_id
+	// on the next request, so a sequential "call_0" would be a visible tell.
 	srv, _ := frameServer(t,
 		toolCallFrame("", "get_weather", `{"city":"Paris"}`),
 		textFrame("", devin.StopNormal, true),
@@ -277,8 +280,17 @@ func TestAStreamedToolCallWithoutAnIDGetsThePlaceholder(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d (body %s)", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), `"id":"call_0"`) {
-		t.Errorf("the streamed tool call never carried the call_0 placeholder: %s", rec.Body)
+	placeholder := regexp.MustCompile(`"id":"(call_[0-9a-f]{24})"`).FindStringSubmatch(rec.Body.String())
+	if placeholder == nil {
+		t.Fatalf("the streamed tool call never carried a call_<24 hex> placeholder: %s", rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), `"id":"call_0"`) {
+		t.Errorf("the streamed tool call carried a sequential placeholder: %s", rec.Body)
+	}
+	// The placeholder must be what the non-streaming path would also produce:
+	// same shape, not necessarily the same value (it is random).
+	if !strings.HasPrefix(placeholder[1], "call_") || len(placeholder[1]) != 29 {
+		t.Errorf("placeholder %q is not call_ + 24 hex", placeholder[1])
 	}
 }
 

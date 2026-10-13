@@ -644,44 +644,73 @@ func TestDecodeAccountStatusReadsBothShapes(t *testing.T) {
 	}
 }
 
-// TestDecodeAccountStatusReadsTopLevelPlanFallback covers the day the backend
-// stops duplicating the plan block inside user_status (field 13) and leaves it
-// only at the response's top-level field 2. The quota fields must still arrive,
-// or ResetDeadline fails open to "no quota extension" and a rate-limited account
-// is retried against a window that has nothing left.
-func TestDecodeAccountStatusReadsTopLevelPlanFallback(t *testing.T) {
-	// A user_status with identity but no plan block, wrapped alongside a
-	// top-level plan_info at field 2.
+// TestDecodeAccountStatusIgnoresTopLevelPlanInfoField2 pins the capture-verified
+// shape of the response's top-level field 2: it is a plan-identity submessage (the
+// account's tier name and its nested identity block), NOT a second copy of the
+// quota block. The decoder must therefore leave PlanFields empty when only field 2
+// is present, rather than dumping 15 non-quota counters into it. An earlier
+// fallback read field 2 as a plan block; a live capture of CLI 3000.11.3 on
+// 2026-10-13 disproved that premise and the fallback was removed.
+//
+// The field-2 payload below is byte-for-byte the shape the capture showed:
+// {1:19, 2:"Free", 3:1, 7:4096, 8:100, 9:2, 10:5000, 12:2500, 13:500, ...} with
+// no quota fields (14-18).
+func TestDecodeAccountStatusIgnoresTopLevelPlanInfoField2(t *testing.T) {
 	inner := pb.NewWriter()
 	inner.String(7, "someone@example.com")
 	w := pb.NewWriter()
 	w.RawBytes(1, inner.Bytes())
 	w.Message(2, func(plan *pb.Writer) {
-		plan.Varint(15, 3)
-		plan.Varint(18, 1790496000)
+		plan.Varint(1, 19)
+		plan.String(2, "Free")
+		plan.Varint(3, 1)
+		plan.Varint(7, 4096)
+		plan.Varint(8, 100)
+		plan.Varint(9, 2)
+		plan.Varint(10, 5000)
+		plan.Varint(12, 2500)
+		plan.Varint(13, 500)
+		plan.Varint(19, 1)
+		plan.Varint(23, 1)
+		plan.Varint(28, 1)
+		plan.Varint(29, 1)
+		plan.Varint(31, 1)
 	})
 
 	got := DecodeAccountStatus(w.Bytes())
 	if got.Email != "someone@example.com" {
 		t.Fatalf("email = %q", got.Email)
 	}
-	if got.WeeklyRemainingPercent == nil || *got.WeeklyRemainingPercent != 3 {
-		t.Fatalf("weekly percentage = %v, want 3 from the top-level plan_info", got.WeeklyRemainingPercent)
+	// The 95-byte field 2 must contribute nothing: no plan name, no quota
+	// counters. Had it been read as a plan block, the nested 8/9/10/12/13
+	// counters would have leaked into PlanFields as non-quota noise.
+	if got.Plan != "" {
+		t.Errorf("Plan = %q, want empty: field 2's name at subfield 2 is not the plan name", got.Plan)
 	}
-	if !got.WeeklyReset.Equal(time.Unix(1790496000, 0).UTC()) {
-		t.Fatalf("weekly reset = %s, want the top-level value", got.WeeklyReset)
+	if len(got.PlanFields) != 0 {
+		t.Errorf("PlanFields = %v, want empty: top-level field 2 is not a plan block", got.PlanFields)
+	}
+	if got.WeeklyRemainingPercent != nil || got.DailyRemainingPercent != nil {
+		t.Errorf("quota percentages = %v/%v, want nil: field 2 carries no quota fields",
+			got.DailyRemainingPercent, got.WeeklyRemainingPercent)
+	}
+	if !got.WeeklyReset.IsZero() || !got.DailyReset.IsZero() {
+		t.Errorf("resets = %v/%v, want zero", got.DailyReset, got.WeeklyReset)
 	}
 }
 
-// TestInnerPlanWinsOverTheTopLevelCopy pins the precedence: when both copies are
-// present — which is the live shape today — the inner field 13 is the verified
-// one the CLI's own cache reads, so the fallback must not overwrite it.
-func TestInnerPlanWinsOverTheTopLevelCopy(t *testing.T) {
+// TestInnerPlanBlockIsTheOnlyQuotaSource pins that the quota lives at the inner
+// user_status field 13 — the copy PROTOCOL.md verified and the CLI's own cache
+// reads — and that a plan-identity block at the response's top-level field 2 is
+// never mistaken for it.
+func TestInnerPlanBlockIsTheOnlyQuotaSource(t *testing.T) {
 	inner := pb.NewWriter()
 	inner.String(7, "someone@example.com")
 	inner.Message(13, func(plan *pb.Writer) { plan.Varint(15, 41) })
 	w := pb.NewWriter()
 	w.RawBytes(1, inner.Bytes())
+	// A plan-identity block at field 2 whose subfield 15 is a non-quota counter:
+	// if it were read as a plan block it would override the real 41%.
 	w.Message(2, func(plan *pb.Writer) { plan.Varint(15, 99) })
 
 	got := DecodeAccountStatus(w.Bytes())

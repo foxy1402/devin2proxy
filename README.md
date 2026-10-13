@@ -155,6 +155,7 @@ config file** — which is what makes `read_only: true` work.
 | `DEVIN2PROXY_DASHBOARD` | `dashboard` | `1` | serve `/dashboard/` |
 | `DEVIN2PROXY_DASHBOARD_PASSWORD` | `dashboard_password` | generated, printed once | dashboard login |
 | `DEVIN2PROXY_DASHBOARD_ALLOW_REMOTE` | `dashboard_allow_remote` | `false` | allow the dashboard from outside the machine; behind a reverse proxy on the same host every visitor appears loopback, so this also means every visitor passes the local-only guard and failed logins share one ban bucket — put the proxy's own auth in front |
+| `DEVIN2PROXY_DASHBOARD_SECURE_COOKIE` | `dashboard_secure_cookie` | `false` | force the `Secure` attribute on the dashboard session cookie. Set it when TLS is terminated at a reverse proxy: there the request has no TLS of its own, so the cookie would otherwise be set without `Secure` and could travel over a plain-HTTP path to the same host |
 | `DEVIN2PROXY_DEVIN_CLI` | `devin_cli` | — | path to the `devin` CLI; shown in the dashboard's terminal command and run by its sign-out endpoint (the sign-in itself never needs it) |
 | `DEVIN2PROXY_DASHBOARD_WEBAPP_HOST` | `dashboard_webapp_host` | `app.devin.ai` | host serving `/auth/cli/continue`, for a non-default sign-in deployment |
 | `DEVIN2PROXY_DASHBOARD_ECHO_URL` | `dashboard_echo_url` | `https://api.ipify.org` | endpoint answering with the caller's address as plain text, fetched through a route **only when that route is tested**; `-` skips it (set `-` if you do not want a route test to contact a third party with the exit IP) |

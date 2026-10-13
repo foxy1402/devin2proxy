@@ -197,6 +197,12 @@ var errNoCredential = errors.New("credential unavailable")
 // complete, so every relay path surfaces it as the failure it is.
 var errBackendStop = errors.New("devin: the backend stopped the generation with an error")
 
+// errRequestTimeout reports that the proxy's own RequestTimeout deadline fired
+// while the client was still connected. It is deliberately distinct from a client
+// disconnect (context.Canceled): a disconnect is routine and answered with
+// silence, while a timeout is a failure the client is still waiting to hear about.
+var errRequestTimeout = errors.New("devin: the request exceeded the proxy timeout")
+
 // clientError wraps a failure caused by the request itself, so a handler can
 // answer 400 instead of rendering it as an upstream fault.
 type clientError struct{ err error }
@@ -334,13 +340,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // own surface.
 const authFailureDelay = 250 * time.Millisecond
 
+// setCORS applies the configured cross-origin policy. Shared by the /v1 handlers
+// and /healthz so the two surfaces cannot drift apart.
+func setCORS(w http.ResponseWriter, allowOrigins string) {
+	w.Header().Set("Access-Control-Allow-Origin", allowOrigins)
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+}
+
 // auth enforces the bearer key. It fails closed: with no key configured nothing
 // is served, so a misconfiguration cannot expose the account.
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", s.cfg.AllowOrigins)
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		setCORS(w, s.cfg.AllowOrigins)
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -383,6 +395,11 @@ func methodIsGetOrHead(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	// The same CORS treatment as /v1/*, so a browser probe of health can read the
+	// response: /healthz is otherwise the one route a cross-origin dashboard would
+	// fail on preflight. It stays unauthenticated; CORS only ever widens who can
+	// read a response the caller could already fetch.
+	setCORS(w, s.cfg.AllowOrigins)
 	if !methodIsGetOrHead(w, r) {
 		return
 	}
@@ -441,10 +458,20 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 // them; the dedup is purely cosmetic, so recording simply stops.
 const maxModelFallbackNotes = 512
 
+// maxModelFallbackKeyBytes bounds the model string used as a dedup key and in the
+// log line. The key is verbatim client input and the request body cap is 8 MiB, so
+// without a bound a client cycling long names could hold hundreds of megabytes in
+// the map and put a multi-megabyte line in the event log. 128 bytes is far longer
+// than any real model id.
+const maxModelFallbackKeyBytes = 128
+
 // noteModelFallback logs a model substitution once per name, so a chatty client
 // cannot flood the log with the same line.
 func (s *Server) noteModelFallback(requested, used string) {
 	name := strings.TrimSpace(requested)
+	if len(name) > maxModelFallbackKeyBytes {
+		name = name[:maxModelFallbackKeyBytes] + "…"
+	}
 	s.fallbackMu.Lock()
 	if s.fallbackSeen == nil {
 		s.fallbackSeen = make(map[string]bool)
@@ -455,7 +482,7 @@ func (s *Server) noteModelFallback(requested, used string) {
 	}
 	s.fallbackMu.Unlock()
 	if !seen {
-		log.Printf("model %q not advertised; using %q (further occurrences are not logged)", requested, used)
+		log.Printf("model %q not advertised; using %q (further occurrences are not logged)", name, used)
 	}
 }
 
@@ -575,7 +602,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		// A client that has gone away has nothing to read an error status, and
-		// writing one would only produce a log line about a broken pipe.
+		// writing one would only produce a log line about a broken pipe. Our own
+		// deadline is different: the client is still connected and waiting, so it
+		// gets the 504 the RequestTimeout deserves.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			traceFrom(r.Context()).fail(errRequestTimeout)
+			writeError(w, http.StatusGatewayTimeout,
+				"the request exceeded the proxy's "+s.cfg.RequestTimeout.String()+" timeout",
+				"api_error", "timeout")
+			return
+		}
 		if ctx.Err() == nil {
 			writeUpstreamOrClientError(w, err)
 		}
@@ -684,6 +720,21 @@ func (s *Server) streamChunks(ctx context.Context, cancel context.CancelFunc, w 
 		}
 		if err != nil {
 			if ctx.Err() != nil {
+				// Two causes reach here and they are not the same. A client that
+				// hung up cancels the context (context.Canceled); our own
+				// RequestTimeout deadline fires with the client still connected
+				// (context.DeadlineExceeded). Only the first is routine and quiet.
+				// The second means the client is still listening and about to get
+				// nothing, so it is reported in-band rather than swallowed.
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					log.Printf("request timed out after %s; ending the upstream stream", s.cfg.RequestTimeout)
+					tr.fail(errRequestTimeout)
+					out.data(string(openai.MarshalError(
+						"the request exceeded the proxy's "+s.cfg.RequestTimeout.String()+" timeout",
+						"api_error", "timeout")))
+					out.done()
+					return
+				}
 				// The client is gone. The backend request was issued with this
 				// context, so cancelling it stops the generation upstream instead
 				// of letting it burn account quota to completion.
@@ -728,11 +779,12 @@ func (s *Server) streamChunks(ctx context.Context, cancel context.CancelFunc, w 
 				if u.Started {
 					d.ID = u.ID
 					// The backend can open a call without an id. The non-streaming
-					// path synthesizes the same call_N placeholder in Calls(), and
-					// the streamed deltas must carry it too, or a client cannot
-					// correlate the fragments with the call it will execute.
+					// path synthesizes the same placeholder in Calls(), and the
+					// streamed deltas must carry it too, or a client cannot
+					// correlate the fragments with the call it will execute. The
+					// shape matches what the backend mints itself (call_ + 24 hex).
 					if d.ID == "" {
-						d.ID = fmt.Sprintf("call_%d", u.Index)
+						d.ID = openai.PlaceholderToolCallID()
 					}
 					d.Type = "function"
 				}
@@ -837,6 +889,17 @@ func (s *Server) writeWholeCompletion(ctx context.Context, w http.ResponseWriter
 		}
 		if err != nil {
 			if ctx.Err() != nil {
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					// Our own RequestTimeout fired, not a client hang-up. The
+					// response has not been committed, so this can still be reported
+					// honestly: 504 rather than a 200 with an empty body.
+					log.Printf("request timed out after %s; no response was committed", s.cfg.RequestTimeout)
+					tr.fail(errRequestTimeout)
+					writeError(w, http.StatusGatewayTimeout,
+						"the request exceeded the proxy's "+s.cfg.RequestTimeout.String()+" timeout",
+						"api_error", "timeout")
+					return
+				}
 				// The client went away while the answer was being aggregated.
 				// There is nobody left to read a 502, and a disconnect is
 				// routine — IDEs cancel on every keystroke — so stay quiet,
@@ -972,6 +1035,15 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 		return built, buildErr
 	})
 	if err != nil {
+		// Same distinction as the chat handler: a client hang-up is silent, our own
+		// RequestTimeout answers 504.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			traceFrom(r.Context()).fail(errRequestTimeout)
+			writeError(w, http.StatusGatewayTimeout,
+				"the request exceeded the proxy's "+s.cfg.RequestTimeout.String()+" timeout",
+				"api_error", "timeout")
+			return
+		}
 		if ctx.Err() == nil {
 			writeUpstreamOrClientError(w, err)
 		}
@@ -999,8 +1071,18 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			if ctx.Err() != nil {
-				// Same as the chat path: a hang-up mid-aggregation is routine
-				// and has no reader for a 502, so it stays quiet.
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					// Same distinction as the chat path: our own deadline fired with
+					// the client still connected, and nothing is committed yet.
+					log.Printf("request timed out after %s; no response was committed", s.cfg.RequestTimeout)
+					tr.fail(errRequestTimeout)
+					writeError(w, http.StatusGatewayTimeout,
+						"the request exceeded the proxy's "+s.cfg.RequestTimeout.String()+" timeout",
+						"api_error", "timeout")
+					return
+				}
+				// A hang-up mid-aggregation is routine and has no reader for a 502,
+				// so it stays quiet.
 				log.Printf("client disconnected; cancelled the upstream stream")
 				return
 			}
@@ -1094,6 +1176,15 @@ func (s *Server) streamCompletion(ctx context.Context, cancel context.CancelFunc
 		}
 		if err != nil {
 			if ctx.Err() != nil {
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					log.Printf("request timed out after %s; ending the completion stream", s.cfg.RequestTimeout)
+					tr.fail(errRequestTimeout)
+					out.data(string(openai.MarshalError(
+						"the request exceeded the proxy's "+s.cfg.RequestTimeout.String()+" timeout",
+						"api_error", "timeout")))
+					out.done()
+					return
+				}
 				log.Printf("client disconnected; cancelled the upstream stream")
 				return
 			}

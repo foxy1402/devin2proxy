@@ -48,7 +48,7 @@ func main() {
 	// with the account's full model list — 251 entries against 4 for this proxy's
 	// own "devin-cli" identity. A status tool should see what the CLI sees, so
 	// that is the default here.
-	ideName := flag.String("ide-name", "chisel", "metadata.ide_name; \"chisel\" is what the CLI sends, and the model list depends on it")
+	ideName := flag.String("ide-name", "chisel", "metadata.ide_name; \"chisel\" is what the CLI's main process sends. As of 2026-10-13 the status response is identical for either identity, so this flag is now for experiments")
 	timeout := flag.Duration("timeout", 30*time.Second, "per-request timeout")
 	flag.Parse()
 
@@ -82,7 +82,7 @@ func main() {
 			fmt.Printf("=== %d/%d  %s ===\n", i+1, len(creds), c.Source)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), *timeout)
-		md := devin.DefaultMetadata(c.APIKey)
+		md := devin.UnaryMetadata(c.APIKey)
 		if *ideName != "" {
 			md.IDEName = *ideName
 		}

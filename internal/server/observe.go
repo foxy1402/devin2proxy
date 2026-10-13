@@ -3,7 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -191,10 +194,28 @@ func (s *Server) observe(next http.Handler) http.Handler {
 		start := time.Now()
 
 		defer func() {
-			// A panic still produces a log line: a request that crashed the handler is
-			// exactly the one worth seeing an entry for.
+			// A panic still produces a log line and a log event: a request that
+			// crashed the handler is exactly the one worth seeing an entry for.
+			//
+			// Note what a panic here does *not* do: it does not kill the process.
+			// net/http already recovers per-connection (its own `http: panic
+			// serving` line), so the earlier reading that "one bad request takes
+			// the proxy offline" was wrong. What it does cost is the response: the
+			// connection is torn down with no status, so the client sees a reset
+			// rather than an answer. When the response has not been committed yet
+			// that is worth fixing — answer 500 and keep the connection usable.
+			// Once bytes are on the wire, though, a normal close would look like a
+			// complete (if empty) response, so the only honest signal left is to
+			// re-panic and let net/http abort the connection.
 			if p := recover(); p != nil {
 				tr.fail(&panicError{p})
+				log.Printf("panic in handler %s %s: %v\n%s", r.Method, r.URL.Path, p, debug.Stack())
+				if rec.status == 0 {
+					writeError(rec, http.StatusInternalServerError,
+						"the proxy hit an internal error handling this request", "api_error", "internal_error")
+					s.emitRequest(r, rec, tr, start)
+					return
+				}
 				s.emitRequest(r, rec, tr, start)
 				panic(p)
 			}
@@ -211,7 +232,9 @@ func (e *panicError) Error() string {
 	if s, ok := e.value.(string); ok {
 		return "handler panic: " + s
 	}
-	return "handler panic"
+	// A non-string panic (runtime.Error, a sentinel type) carries its detail in
+	// its own String(), which the old form dropped. %v keeps it for the log.
+	return fmt.Sprintf("handler panic: %v", e.value)
 }
 
 // emitRequest turns the trace and the recorded response into one event.

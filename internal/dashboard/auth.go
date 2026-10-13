@@ -257,6 +257,15 @@ func (d *Dashboard) validSession(value string, now time.Time) bool {
 	return now.Unix() < p.Exp
 }
 
+func (d *Dashboard) sessionCookieSecure(r *http.Request) bool {
+	// Secure is on over TLS, and can be forced on with the config knob for a
+	// deployment that terminates TLS at a reverse proxy: there r.TLS is nil while
+	// the client is in fact on HTTPS, and the cookie would otherwise be sent
+	// without Secure. Setting it on a genuinely plain-HTTP loopback setup would
+	// make the cookie vanish, which is why it is not the default.
+	return d.cfg.SecureCookie || r.TLS != nil
+}
+
 func (d *Dashboard) setSessionCookie(w http.ResponseWriter, r *http.Request, value string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
@@ -264,10 +273,8 @@ func (d *Dashboard) setSessionCookie(w http.ResponseWriter, r *http.Request, val
 		Path:     dashboardPrefix,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		// Secure only over TLS: setting it on plain HTTP would make the cookie
-		// vanish on the loopback setup this is normally run as.
-		Secure: r.TLS != nil,
-		MaxAge: int(sessionTTL.Seconds()),
+		Secure:   d.sessionCookieSecure(r),
+		MaxAge:   int(sessionTTL.Seconds()),
 	})
 }
 
@@ -278,7 +285,7 @@ func (d *Dashboard) clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 		Path:     dashboardPrefix,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
+		Secure:   d.sessionCookieSecure(r),
 		MaxAge:   -1,
 	})
 }

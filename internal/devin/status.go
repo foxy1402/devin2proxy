@@ -3,7 +3,6 @@ package devin
 import (
 	"context"
 	"errors"
-	"log"
 	"strings"
 	"time"
 
@@ -172,16 +171,17 @@ func soonest(times []time.Time, now time.Time) time.Time {
 // FetchAccountStatus asks the backend who this credential is and how much quota
 // it has left. It is a plain unary call, so it spends no chat quota.
 //
-// Metadata is sent as this proxy's own identity rather than the CLI's "chisel".
-// Both were checked against the live endpoint and the plan block is the same
-// either way; the model list does differ between them, so what comes back here is
-// the entitlement of this identity, not of the CLI. The account's plan, quota and
-// identity — everything the pool acts on — are unaffected by the choice.
+// Metadata is sent as the unary shape the CLI itself uses (see UnaryMetadata):
+// the identity "chisel" rather than the chat path's "devin-cli", and no field 28.
+// A capture of CLI 3000.11.3 on 2026-10-13 showed the status response to be
+// byte-identical across every identity the CLI sends ("chisel" with either
+// version, and "devin-cli"), so the account's plan, quota and model list do not
+// depend on this choice; it is mimicry, not a functional requirement.
 func (c *Client) FetchAccountStatus(ctx context.Context, creds *Credentials) (*AccountStatus, error) {
 	if creds == nil || creds.APIKey == "" {
 		return nil, errors.New("devin: no credential available")
 	}
-	body, err := c.PostUnary(ctx, creds, StatusPath, EncodeMetadataRequest(DefaultMetadata(creds.APIKey)))
+	body, err := c.PostUnary(ctx, creds, StatusPath, EncodeMetadataRequest(UnaryMetadata(creds.APIKey)))
 	if err != nil {
 		return nil, err
 	}
@@ -203,12 +203,18 @@ func DecodeAccountStatus(b []byte) *AccountStatus {
 func decodeStatusFields(b []byte, s *AccountStatus, depth int) {
 	var inner []byte
 	// The response is { 1: user_status, 2: plan_info }, and the inner user_status
-	// carries the same plan block at its own field 13, which is the copy the
-	// CLI's cache stores and the one PROTOCOL.md verified. The top-level field 2
-	// is kept as a fallback for the day the backend stops duplicating it: without
-	// this, quota and plan reads would go blind on a response that still carries
-	// them, and ResetDeadline would fail open to "no quota extension".
-	var planFallback []byte
+	// carries the plan block at its own field 13, which is what PROTOCOL.md
+	// verified and what this reads.
+	//
+	// Top-level field 2 is NOT a second copy of that plan block. A live capture of
+	// the CLI 3000.11.3 response (2026-10-13) shows field 2 to be a 95-byte
+	// plan-identity submessage ({1:19, 2:"Free", 3:1, 7:4096, 8:100, 9:2, 10:5000,
+	// 12:2500, 13:500, ...}) with none of the quota fields (14-18) — the same shape
+	// as the plan block's own nested identity. Reading it as a plan block would
+	// dump non-quota counters into PlanFields. An earlier fallback that did exactly
+	// that (added on the assumption field 2 duplicated the plan) was removed after
+	// the capture disproved the premise. If inner field 13 ever disappears, re-derive
+	// from a fresh capture rather than guessing at field 2 again.
 	r := pb.NewReader(b)
 	for {
 		field, wire, ok := r.Field()
@@ -218,8 +224,6 @@ func decodeStatusFields(b []byte, s *AccountStatus, depth int) {
 		switch {
 		case field == 1 && wire == pb.WireBytes:
 			inner = r.Bytes()
-		case field == 2 && wire == pb.WireBytes && depth == 0:
-			planFallback = r.Bytes()
 		case field == 3 && wire == pb.WireBytes:
 			s.Name = r.String()
 		case field == 5 && wire == pb.WireBytes:
@@ -241,29 +245,6 @@ func decodeStatusFields(b []byte, s *AccountStatus, depth int) {
 	if depth == 0 && s.Email == "" && s.Name == "" && len(inner) > 0 {
 		decodeStatusFields(inner, s, 1)
 	}
-	// Only reached when the inner message did not supply a plan: if the verified
-	// field 13 was present this is a no-op, and if it was not, the top-level copy
-	// keeps the numbers and the log line says why the source moved. Gated on the
-	// wrapper being present (field 1) because the bare cache shape has no
-	// plan_info at field 2 at all — reading a UserStatus's own field 2 as a plan
-	// block there would be a misread, so the fallback applies only to the
-	// documented wrapped response.
-	if depth == 0 && len(inner) > 0 && len(planFallback) > 0 && !s.hasPlanData() {
-		log.Printf("devin: status response carried plan_info only at the top level (field 2), not the inner field 13; reading the fallback copy")
-		decodePlan(planFallback, s)
-	}
-}
-
-// hasPlanData reports whether any of the plan block's fields have been filled,
-// which is how the decoder decides whether the top-level plan_info copy is worth
-// consulting.
-func (s *AccountStatus) hasPlanData() bool {
-	return s.Plan != "" ||
-		s.DailyRemainingPercent != nil ||
-		s.WeeklyRemainingPercent != nil ||
-		s.OverageBalanceMicros != nil ||
-		!s.DailyReset.IsZero() ||
-		!s.WeeklyReset.IsZero()
 }
 
 // decodePlan reads the plan block: the plan's name at its nested field 1 → 2, the

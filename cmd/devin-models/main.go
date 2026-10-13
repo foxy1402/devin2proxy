@@ -27,7 +27,7 @@ import (
 func main() {
 	path := flag.String("file", "", "capture file holding a GetCliModelConfigs response")
 	live := flag.Bool("live", false, "call GetCliModelConfigs for real instead of reading a capture")
-	ide := flag.String("ide", devin.CLIIdentity, "with -live: metadata.ide_name. The default, chisel, is what the CLI sends and the only identity that returns the coding catalogue; \"devin-cli\" returns the one-entry chat list instead")
+	ide := flag.String("ide", devin.CLIIdentity, "with -live: metadata.ide_name. The default, chisel, is what the CLI's main process sends; as of 2026-10-13 the backend returns the same catalogue for either identity, so this flag is now for experiments")
 	uid := flag.String("uid", "", "only print the entry whose model uid matches (substring)")
 	available := flag.Bool("available", false, "only print models that are not gated behind a higher plan")
 	dump := flag.Bool("dump", false, "also print the raw wire dump of each matching entry")
@@ -41,7 +41,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "credential: %v\n", err)
 			os.Exit(1)
 		}
-		md := devin.DefaultMetadata(creds.APIKey)
+		md := devin.UnaryMetadata(creds.APIKey)
 		if *ide != "" {
 			md.IDEName = *ide
 		}

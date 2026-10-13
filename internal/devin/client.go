@@ -567,18 +567,51 @@ func (c *Client) PostUnary(ctx context.Context, creds *Credentials, path string,
 	return body, nil
 }
 
-// DefaultMetadata returns the metadata block the CLI sends, limited to the
-// fields the backend actually needs. The large opaque field 31 the CLI also
-// sends was omitted and the backend accepted the request without it.
+// DefaultMetadata returns the metadata block the chat path sends. It matches a
+// live capture of the CLI 3000.11.3 GetChatMessage request byte for byte: the
+// identity "devin-cli", the running version in both version fields, the
+// extension name "chisel", and field 28 also "chisel". The large opaque field 31
+// the CLI sends alongside was omitted, and the backend accepts the request
+// without it (see UnaryMetadata for the separate unary shape).
 func DefaultMetadata(apiKey string) *Metadata {
 	return &Metadata{
 		IDEName:          "devin-cli",
-		ExtensionVersion: "3000.11.1",
+		ExtensionVersion: "3000.11.3",
 		APIKey:           apiKey,
 		Locale:           "en",
 		OS:               platformOS(),
-		IDEVersion:       "3000.11.1",
+		IDEVersion:       "3000.11.3",
 		ExtensionName:    "chisel",
+		Field28:          "chisel",
+	}
+}
+
+// UnaryMetadata returns the metadata block the CLI sends on its unary calls
+// (GetUserStatus, GetCliTeamSettings, GetCliModelConfigs), which is a different
+// identity from the chat path: the ide_name is "chisel" rather than "devin-cli"
+// and field 28 is absent.
+//
+// The two shapes are kept apart because field 28 rides along in the same message
+// on the chat path but is not sent on unary calls — a single builder could not be
+// right for both. The identity is also not cosmetic for the catalogue: asked as
+// "chisel", GetCliModelConfigs returns the full model catalogue. A capture of the
+// CLI 3000.11.3 (2026-10-13) shows both unary identities present in its own
+// traffic ("chisel" on the main process, "devin-cli" from the ACP child); this
+// standardises on "chisel", the shape the main process uses.
+//
+// The version on a unary call is not always the running version: the CLI's very
+// first GetUserStatus of a session is sent as "0.0.0-dev", before it resolves its
+// own version. Every later call carries the running version, so that is what is
+// sent here for all of them.
+func UnaryMetadata(apiKey string) *Metadata {
+	return &Metadata{
+		IDEName:          CLIIdentity,
+		ExtensionVersion: "3000.11.3",
+		APIKey:           apiKey,
+		Locale:           "en",
+		OS:               platformOS(),
+		IDEVersion:       "3000.11.3",
+		ExtensionName:    CLIIdentity,
 	}
 }
 

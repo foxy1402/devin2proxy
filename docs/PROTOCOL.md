@@ -201,25 +201,35 @@ Field numbers as observed. `GetChatMessageRequest`:
 | 8 | `configuration` | CompletionConfiguration | sampling parameters |
 | 10 | `tools` | repeated ChatToolDefinition | 25 entries from the CLI |
 | 15 | `trajectory_reference` | TrajectoryReference | a fresh one starts a new conversation |
-| 16 | `cascade_id` | string | CLI sent it empty |
+| 16 | `cascade_id` | string | a UUID, fixed per conversation; the proxy sends a fresh one per request |
 | 20 | `planner_mode` | enum | CLI sends `1` (DEFAULT) |
 | 21 | `chat_model_uid` | string | **required**, e.g. `swe-1-6-slow` |
 | 22 | `execution_id` | string | CLI sent it empty |
+| 28 | | the per-session codename; an adjective-noun string, e.g. `warm-soul` |
 
 `Metadata`:
 
 | # | field | notes |
 |---|-------|-------|
-| 1 | `ide_name` | CLI sends `"devin-cli"` |
-| 2 | `extension_version` | `"3000.11.1"` |
+| 1 | `ide_name` | `"chisel"` on unary calls; `"devin-cli"` on `GetChatMessage` |
+| 2 | `extension_version` | the running version, e.g. `"3000.11.3"`; the CLI's first GetUserStatus of a session sends `"0.0.0-dev"` |
 | 3 | `api_key` | **required**; the token again |
 | 4 | `locale` | `"en"` |
 | 5 | `os` | `"windows"` |
-| 7 | `ide_version` | `"3000.11.1"` |
+| 7 | `ide_version` | the running version, e.g. `"3000.11.3"` |
 | 12 | `extension_name` | `"chisel"` (the CLI's internal codename) |
-| 28 | | repeated `"chisel"` |
-| 30 | | packed varints, values around 10–60 (inferred: capability flags) |
-| 31 | | 512-byte opaque blob, looks like an integrity hash |
+| 28 | | `"chisel"`, sent on the chat path only; absent on unary calls |
+| 30 | | packed varints, empty in the CLI's Linux traffic (inferred: capability flags) |
+| 31 | | opaque blob, **366 bytes and different on every request** (per-request data, not replayable) |
+
+`TrajectoryReference`:
+
+| # | field | notes |
+|---|-------|-------|
+| 1 | `trajectory_id` | UUID |
+| 2 | | present on later rounds only (a round counter: `1`, `2`, `3`…) |
+| 3 | `trajectory_type` | `4` |
+| 4 | | `14` on the opening round of a conversation, absent afterwards |
 
 `ChatMessagePrompt`:
 
@@ -576,19 +586,25 @@ the second and third are, so they are left unread rather than labelled. No field
 states a currency either, so the price is best read as "the number the catalogue
 reports per 1M tokens" rather than a dollar figure.
 
-**The catalogue is identity-dependent, and the identity is what makes it useful.**
-Asked with this proxy's own `ide_name = "devin-cli"`, `GetCliModelConfigs` answers
-with a **single entry** — `MODEL_CHAT_GPT_4_1_2025_04_14`, the same chat model the
-status call lists first, priced properly here at 2 / 0.5 / 8 per 1M tokens and with
-capabilities `[8 11 12]`. Asked as the CLI's `"chisel"`, the same call returns the
-real catalogue: **248 entries** on 2026-09-23, from `swe-1-6-slow` through the
-`swe-1-7`/`swe-2` families, with every limit and price populated. So the dashboard's
-Models panel and `cmd/devin-models -live` both ask as the CLI — that is the only way
-to get the numbers an IDE's model picker would show — while the chat path keeps its
-own identity. `-ide devin-cli` reproduces the one-entry answer.
+**The catalogue's identity dependence has lapsed.** Asked with the chat path's
+`ide_name = "devin-cli"`, `GetCliModelConfigs` used to answer with a **single
+entry** — `MODEL_CHAT_GPT_4_1_2025_04_14`, the same chat model the status call
+lists first, priced properly here at 2 / 0.5 / 8 per 1M tokens and with
+capabilities `[8 11 12]` — while asked as the CLI's `"chisel"` it returned the real
+catalogue: **248 entries** on 2026-09-23, from `swe-1-6-slow` through the
+`swe-1-7`/`swe-2` families, with every limit and price populated.
 
-Read live, the account's position is unambiguous: of the 248 entries **exactly one is
-not plan-gated on a free account**, and it is the model this proxy defaults to.
+A live capture of CLI 3000.11.3 on **2026-10-13** no longer reproduces that split:
+the CLI sent `GetCliModelConfigs` under both `"chisel"` and `"devin-cli"` and got
+back the **same catalogue bytes both times** (`3,695,732 B`, sha256 `298b4e6f…`).
+The backend no longer appears to gate the catalogue on `ide_name`. The proxy still
+asks as `"chisel"` — that is the CLI's main-process shape — but this must not be
+reverted on the now-dead premise that only `"chisel"` gets a real catalogue. The
+demonstration below is from the 2026-09-23 run and the entry count will differ now
+(the catalogue grows and shrinks as Devin ships models).
+
+Read live, the account's position was unambiguous: of the 248 entries **exactly one
+was not plan-gated on a free account**, and it is the model this proxy defaults to.
 
 ```
 > bin\devin-models.exe -live -available
@@ -646,10 +662,19 @@ obviously an authentication problem and is why the shape had to be captured
 rather than guessed. The captured request is 982 bytes beginning `0a d3 07`
 (field 1, 979 bytes) and continuing `0a 06 "chisel"` (ide name), `12 …`
 (extension version), `1a bd 01 …` (the token, 189 bytes), `22 02 "en"`, `2a 07
-"windows"`, `3a …` (ide version), `62 06 "chisel"`, and a 732-byte opaque field 31.
+"windows"`, `3a …` (ide version), `62 06 "chisel"`, and a 366-byte opaque field 31
+(a fresh value on every request; older CLI builds sent 732 of hex, i.e. the same
+366 bytes).
 
-`GetUserStatusResponse` is `{ 1: user_status, 2: plan_info }`. Reading the inner
-message off a live response and off the CLI's cached copy of the same call:
+`GetUserStatusResponse` is `{ 1: user_status, 2: plan_info }`. **Top-level field 2
+is not the quota block.** A live capture of CLI 3000.11.3 on 2026-10-13 shows it to
+be a 95-byte plan-*identity* submessage — `{1:19, 2:"Free", 3:1, 7:4096, 8:100,
+9:2, 10:5000, 12:2500, 13:500, 19:1, 23:1, 24:<45-byte block>, 28:1, 29:1, 31:1,
+34:1, 35:2}` — carrying the tier and its nested metadata but **none of the quota
+fields (14–18)**. The quota block is the one nested inside `user_status` at field
+13. Reading top-level field 2 as a plan block would inject 15 non-quota counters
+into the plan's unnamed-field map; the proxy reads only inner field 13. Reading the
+inner message off a live response and off the CLI's cached copy of the same call:
 
 | field | type | meaning |
 |---|---|---|
